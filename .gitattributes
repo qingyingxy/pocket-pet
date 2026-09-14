@@ -1,0 +1,9 @@
+* text=auto
+*.rs text eol=lf
+*.slint text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

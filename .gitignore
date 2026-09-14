@@ -1,0 +1,12 @@
+# Build outputs and local previews
+**/target/
+/rustup-init.exe
+/slint-preview/preview-output/
+
+# Local environment and OS files
+.env
+.env.*
+!.env.example
+*.log
+Thumbs.db
+.DS_Store

@@ -1,0 +1,150 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct CardData { id:int, body:string, preview:image, has-image:bool, image-count:int, done:bool }
+
+component Action inherits Rectangle {
+    in property<string> label;
+    in property<bool> primary:false;
+    in property<bool> quiet:false;
+    callback clicked();
+    height:38px;
+    border-radius:12px;
+    background: root.primary ? (hit.pressed ? #ae5734 : hit.has-hover ? #c66c44 : #d77d53) : (hit.has-hover ? #eee7df : root.quiet ? transparent : #f3eee8);
+    animate background { duration:100ms; }
+    Text { text:root.label; color:root.primary ? #ffffff : #7a685b; font-size:13px; horizontal-alignment:center; vertical-alignment:center; }
+    hit:=TouchArea { mouse-cursor:pointer; clicked=>{root.clicked();} }
+}
+
+export component PetWindow inherits Window {
+    width:166px; height:172px; background:transparent; no-frame:true; always-on-top:true;
+    default-font-family:"Microsoft YaHei UI";
+    in property<int> count;
+    in property<bool> happy:false;
+    in property<string> toast;
+    in property<bool> can-undo:false;
+    in property<bool> toast-error:false;
+    callback undo();
+    callback open-record(); callback open-tasks(); callback drag(float,float); callback drag-finished();
+    private property<length> origin-x; private property<length> origin-y;
+    private property<bool> was-dragged:false;
+    Image { source:@image-url("cat.svg"); x:19px; y:root.happy ? 0px : 7px; width:128px; height:128px; image-fit:contain; animate y {duration:170ms;easing:ease-out;} }
+    TouchArea { x:12px;y:0px;width:142px;height:133px;mouse-cursor:pointer;
+        pointer-event(event)=>{
+            if event.kind == PointerEventKind.down {root.origin-x=self.mouse-x;root.origin-y=self.mouse-y;root.was-dragged=false;}
+            if event.kind == PointerEventKind.up {root.drag-finished();}
+        }
+        moved=>{if self.pressed {
+            if self.mouse-x - root.origin-x>4px || self.mouse-x - root.origin-x < -4px || self.mouse-y - root.origin-y>4px || self.mouse-y - root.origin-y < -4px {
+                root.was-dragged=true;root.drag((self.mouse-x - root.origin-x)/1px,(self.mouse-y - root.origin-y)/1px);
+            }
+        }}
+        clicked=>{if !root.was-dragged {root.open-record();}}
+    }
+    Rectangle {x:root.toast!=""?6px:31px;y:137px;width:root.toast!=""?154px:104px;height:30px;border-radius:15px;background:root.can-undo?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
+        animate background {duration:120ms;}
+        Text {text:root.toast!=""?root.toast:"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
+        TouchArea {mouse-cursor:pointer;clicked=>{if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
+    }
+}
+
+export component PocketWindow inherits Window {
+    title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
+    out property<float> panel-height:root.task-view ? 570 : root.has-attachment ? 380 : root.draft != "" ? 300 : 268;
+    in property<int> focus-token;
+    background:transparent;no-frame:true;always-on-top:true;default-font-family:"Microsoft YaHei UI";
+    in property<bool> revealed:false;
+    in-out property<bool> task-view:false;
+    in-out property<string> draft;
+    in property<bool> editing:false;
+    in property<bool> has-attachment:false;
+    in property<image> attachment;
+    in property<int> attachment-count;
+    in property<int> pending-count;
+    in property<[CardData]> cards;
+    in property<bool> show-done:false;
+    in property<string> notice;
+    callback save();callback draft-edited(string);callback paste-image() -> bool;callback capture();callback remove-image();
+    callback toggle(int);callback edit(int);callback fold();callback dismiss();callback quit();callback change-view(bool);
+    Rectangle {
+        x:12px;y:root.revealed?12px:20px;width:parent.width - 24px;height:parent.height - 24px;
+        opacity:root.revealed?1:0;
+        animate opacity {duration:160ms;easing:ease-out;}
+        animate y {duration:160ms;easing:ease-out;}
+        background:#fffdf9;border-radius:24px;border-width:1px;border-color:#eadfd3;
+        drop-shadow-color:#183d2817;drop-shadow-blur:12px;drop-shadow-offset-y:4px;
+        VerticalLayout {
+            padding:20px;spacing:12px;
+            HorizontalLayout {height:30px;spacing:8px;
+                Rectangle {width:28px;height:28px;border-radius:9px;background:#f7e6d7;Text{text:"口";color:#b4774c;font-size:16px;horizontal-alignment:center;vertical-alignment:center;}}
+                Text{text:"口袋";font-size:14px;font-weight:600;color:#695447;vertical-alignment:center;}
+                Rectangle {horizontal-stretch:1;}
+                Action {width:68px;height:28px;quiet:true;label:root.task-view?"随手记":"待办 " + root.pending-count;clicked=>{root.change-view(!root.task-view);}}
+                Action {width:28px;height:28px;quiet:true;label:"×";clicked=>{root.dismiss();}}
+            }
+            if !root.task-view : VerticalLayout {spacing:12px;
+                Rectangle {height:root.has-attachment?190px:root.draft!=""?110px:78px;background:#f7f3ed;border-radius:16px;border-width:1px;border-color:input.has-focus?#dbb89c:#eee5dc;
+                    animate border-color {duration:120ms;}
+                    if root.draft=="" : Text {x:16px;y:14px;text:"记点什么，或粘贴截图…";color:#baa99a;font-size:15px;}
+                    input:=TextInput {
+                        x:16px;y:14px;width:parent.width - 32px;height:root.draft!=""||root.has-attachment?80px:50px;
+                        text<=>root.draft;single-line:false;wrap:word-wrap;color:#504033;font-size:15px;
+                        in property<int> focus-trigger:root.focus-token;
+                        init=>{self.focus();}
+                        changed focus-trigger=>{self.focus();}
+                        edited=>{root.draft-edited(self.text);}
+                        key-pressed(event)=>{
+                            if self.preedit-text!="" {return reject;}
+                            if event.text==Key.Escape {root.dismiss();return accept;}
+                            if event.text==Key.Return && !event.modifiers.shift && !event.modifiers.control && !event.modifiers.alt {
+                                root.save();return accept;
+                            }
+                            if (event.modifiers.control && (event.text=="v" || event.text=="V")) || (event.modifiers.shift && event.text==Key.Insert) {
+                                if root.paste-image() {return accept;}
+                            }
+                            return reject;
+                        }
+                    }
+                    if root.has-attachment : Rectangle {x:14px;y:104px;width:parent.width - 28px;height:70px;border-radius:12px;background:#fffdf9;
+                        Image {x:8px;y:8px;width:76px;height:54px;source:root.attachment;image-fit:contain;}
+                        Text {x:94px;y:22px;text:root.attachment-count + " 张图片";font-size:12px;color:#9c8371;}
+                        Action{x:parent.width - 48px;y:17px;width:32px;height:30px;quiet:true;label:"×";clicked=>{root.remove-image();}}
+                    }
+                }
+                HorizontalLayout {height:40px;spacing:8px;
+                    Text{text:"Enter 收下 · Shift+Enter 换行";font-size:11px;color:#a18e7e;vertical-alignment:center;}
+                    Rectangle{horizontal-stretch:1;}
+                    Action{label:root.editing?"完成编辑":"收下";width:106px;primary:true;clicked=>{root.save();}}
+                }
+            }
+            if root.task-view : VerticalLayout {spacing:12px;
+                HorizontalLayout {height:38px;
+                    Text{text:"待办事项";color:#3f3129;font-size:24px;font-weight:700;}
+                    Rectangle{horizontal-stretch:1;}
+                    Text{text:root.pending-count + " 件待处理";font-size:12px;color:#ad8b73;vertical-alignment:center;}
+                }
+                ScrollView {height:338px;
+                    VerticalLayout {spacing:10px;
+                        for card in root.cards : Rectangle {height:card.has-image?112px:86px;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:#eee4d9;
+                            Rectangle{x:14px;y:18px;width:22px;height:22px;border-radius:11px;border-width:1px;border-color:card.done?#b7c5a6:#d2bdab;background:card.done?#e5ecdd:#fffdf9;
+                                Text{text:card.done?"✓":"";color:#73935a;horizontal-alignment:center;vertical-alignment:center;}
+                                TouchArea{mouse-cursor:pointer;clicked=>{root.toggle(card.id);}}
+                            }
+                            Text{x:48px;y:16px;width:parent.width - (card.has-image?142px:66px);height:44px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
+                            Text{x:48px;y:parent.height - 26px;text:card.done?"已经完成":"点击补充内容";font-size:11px;color:#b39c88;}
+                            TouchArea{x:44px;y:0;width:parent.width - 44px;height:parent.height;mouse-cursor:pointer;clicked=>{root.edit(card.id);}}
+                            if card.has-image : Image{x:parent.width - 88px;y:14px;width:72px;height:68px;source:card.preview;image-fit:contain;}
+                        }
+                        if root.cards.length==0 : Rectangle{height:180px;Text{text:"口袋空空，心里轻轻。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
+                    }
+                }
+                Action{label:root.show-done?"收起已完成":"查看已完成";height:28px;quiet:true;clicked=>{root.fold();}}
+            }
+            HorizontalLayout {height:20px;
+                Rectangle {width:5px;height:5px;border-radius:3px;background:root.notice!=""?#dca875:#adc19b;}
+                Text{text:root.notice!=""?root.notice:"只存本机 · 随时收起";color:#b39e8c;font-size:11px;vertical-alignment:center;}
+                Rectangle{horizontal-stretch:1;}
+                Action{label:"退出";quiet:true;width:36px;height:20px;clicked=>{root.quit();}}
+            }
+        }
+    }
+}

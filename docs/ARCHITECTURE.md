@@ -1,0 +1,42 @@
+# 项目结构
+
+当前保留两个独立二进制项目，未设置 Cargo workspace。根目录 Cargo 命令针对 Win32 原型；Slint 命令显式传入 `--manifest-path slint-preview/Cargo.toml`。
+
+```text
+note/
+├── Cargo.toml / Cargo.lock      原生版依赖
+├── src/
+│   ├── main.rs                  原生版入口
+│   └── ui.rs                    Win32 窗口、绘制与业务交互
+├── slint-preview/
+│   ├── Cargo.toml / Cargo.lock  Slint 版依赖
+│   ├── build.rs                编译 Slint UI
+│   ├── src/
+│   │   ├── main.rs              数据、剪贴板、窗口定位与 UI 回调
+│   │   └── hotkey.rs            全局快捷键注册与消息线程
+│   └── ui/
+│       ├── app.slint            小猫窗口、输入气泡、待办卡片
+│       └── cat.svg              矢量小猫
+└── docs/                       原生版说明、路线与结构说明
+```
+
+## Slint 运行方式
+
+使用 winit 窗口后端与软件渲染器。小猫和内容面板是两个无边框透明置顶窗口；面板按显示器工作区定位。交互使用短动画和单次定时器。
+
+普通输入通过 Slint 回调修改编辑缓冲，停顿 600 毫秒后保存。全局快捷键线程阻塞等待 Windows 消息，将收下请求投递到 Slint 主事件循环；读取剪贴板、保存和更新 UI 都由主线程执行。
+
+`Store` 保存记录、草稿、当前编辑目标、缩略图缓存和一次性撤销状态。撤销检查截止时间、记录内容及编辑状态，并在写盘成功后结束撤销。
+
+## 数据文件
+
+Slint 数据目录为 `%LOCALAPPDATA%\PocketPetSlintPreview`：
+
+- `state.json`：记录和草稿。
+- `state.backup.json`：上一次写入前的状态。
+- `state.tmp`：写入临时文件，再替换正式文件。
+- `images/`：剪贴板图片；移除引用或撤销不删除图片，保留备份引用有效性。
+
+`--snapshot` 改用 `slint-preview/preview-output/`，使用示例数据生成真实渲染截图和输入事件检查结果。该目录不进入 Git。
+
+当前 Slint 主文件仍集中包含多种职责。后续增加提醒时可将持久化与记录操作提取成模块；本次整理保留现有源码路径，避免影响已有构建和运行方式。
