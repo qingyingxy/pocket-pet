@@ -13,11 +13,13 @@ use std::{
 };
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 slint::include_modules!();
+mod attention;
 mod clipboard;
 mod drop_import;
 mod drop_target;
 mod hotkey;
 mod reminders;
+mod snap;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Attachment {
@@ -46,6 +48,27 @@ struct Store {
     dir: PathBuf,
     cache: HashMap<String, Image>,
     undo: Option<CaptureUndo>,
+    completion: Option<CompletionUndo>,
+    snap_rects: HashMap<usize, [f32; 6]>,
+    snaps: HashMap<usize, SnapVisual>,
+    finishing: HashMap<usize, (Note, bool, Instant)>,
+}
+struct SnapVisual {
+    backdrop: Image,
+    layers: ModelRc<DustLayer>,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    running: bool,
+    bytes: usize,
+    prepare_ms: f64,
+}
+struct CompletionUndo {
+    index: usize,
+    before: Note,
+    after: Note,
+    deadline: Instant,
 }
 struct CaptureUndo {
     index: usize,
@@ -69,6 +92,10 @@ impl Store {
             dir,
             cache: HashMap::new(),
             undo: None,
+            completion: None,
+            snap_rects: HashMap::new(),
+            snaps: HashMap::new(),
+            finishing: HashMap::new(),
         })
     }
     fn flush(&mut self) -> Result<()> {
@@ -184,6 +211,42 @@ impl Store {
         }
         Ok(())
     }
+    fn complete(&mut self, index: usize) -> Result<()> {
+        let before = self.data.notes.get(index).ok_or("记录不存在")?.clone();
+        if before.done || self.finishing.contains_key(&index) {
+            return Err("这条记录已经完成".into());
+        }
+        self.toggle_note(index)?;
+        self.completion = Some(CompletionUndo {
+            index,
+            before: before.clone(),
+            after: self.data.notes[index].clone(),
+            deadline: Instant::now() + UNDO_DURATION,
+        });
+        self.undo = None;
+        self.finishing.insert(
+            index,
+            (before, false, self.completion.as_ref().unwrap().deadline),
+        );
+        Ok(())
+    }
+    fn undo_completion(&mut self) -> Result<()> {
+        let undo = self.completion.as_ref().ok_or("没有可撤销的完成操作")?;
+        if Instant::now() >= undo.deadline {
+            return Err("撤销时间已过，可在已完成中恢复".into());
+        }
+        if self.data.notes.get(undo.index) != Some(&undo.after) {
+            return Err("记录已修改，已保留".into());
+        }
+        let index = undo.index;
+        let before = undo.before.clone();
+        self.update_record(index, |n| *n = before)?;
+        self.finishing.remove(&index);
+        self.snaps.remove(&index);
+        self.snap_rects.remove(&index);
+        self.completion = None;
+        Ok(())
+    }
     fn thumbnail(&mut self, name: &str) -> Image {
         if let Some(image) = self.cache.get(name) {
             return image.clone();
@@ -288,6 +351,7 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
     let count = store.data.notes.iter().filter(|n| !n.done).count() as i32;
     ui.set_pending_count(count);
     pet.set_count(count);
+    let old_due = pet.get_due_count();
     pet.set_due_count(
         store
             .data
@@ -296,9 +360,30 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
             .filter(|n| reminders::is_due(n.remind_at, n.done, now))
             .count() as i32,
     );
+    if pet.get_due_count() > old_due && !ui.get_revealed() && !pet.get_drop_busy() {
+        let label = store
+            .data
+            .notes
+            .iter()
+            .find(|n| reminders::is_due(n.remind_at, n.done, now))
+            .map(|n| {
+                if n.text.is_empty() {
+                    "查看这条记录".to_string()
+                } else {
+                    n.text.chars().take(8).collect()
+                }
+            })
+            .unwrap_or_default();
+        nudge(pet, format!("提醒：{label}"));
+    }
     let mut cards = vec![];
     for i in (0..store.data.notes.len()).rev() {
-        let n = store.data.notes[i].clone();
+        let n = store
+            .finishing
+            .get(&i)
+            .map(|(n, _, _)| n)
+            .unwrap_or(&store.data.notes[i])
+            .clone();
         if n.done && !ui.get_show_done() {
             continue;
         }
@@ -309,6 +394,28 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
             .unwrap_or_default();
         cards.push(CardData {
             id: i as i32,
+            snap_ready: store.snaps.contains_key(&i),
+            snap_running: store.snaps.get(&i).is_some_and(|s| s.running),
+            snap_layers: store
+                .snaps
+                .get(&i)
+                .map(|s| s.layers.clone())
+                .unwrap_or_default(),
+            snap_backdrop: store
+                .snaps
+                .get(&i)
+                .map(|s| s.backdrop.clone())
+                .unwrap_or_default(),
+            snap_x: store.snaps.get(&i).map_or(0., |s| s.x),
+            snap_y: store.snaps.get(&i).map_or(0., |s| s.y),
+            snap_width: store.snaps.get(&i).map_or(0., |s| s.width),
+            snap_height: store.snaps.get(&i).map_or(0., |s| s.height),
+            frozen_height: store.snap_rects.get(&i).map_or(0., |r| r[3]),
+            dissolving: store.finishing.contains_key(&i),
+            collapsing: store
+                .finishing
+                .get(&i)
+                .is_some_and(|(_, collapse, _)| *collapse),
             body: if n.text.is_empty() && !n.files.is_empty() {
                 n.files
                     .iter()
@@ -333,7 +440,30 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
         });
     }
     cards.sort_by_key(|n| (n.done, !n.due));
-    ui.set_cards(ModelRc::new(VecModel::from(cards)));
+    use slint::Model;
+    let current = ui.get_cards();
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<CardData>>() {
+        for (row, card) in cards.iter().enumerate() {
+            if !model.row_data(row).is_some_and(|old| old.id == card.id) {
+                if let Some(old_row) = (row..model.row_count())
+                    .find(|&r| model.row_data(r).is_some_and(|old| old.id == card.id))
+                {
+                    model.remove(old_row);
+                }
+                model.insert(row, card.clone());
+            } else {
+                model.set_row_data(row, card.clone());
+            }
+        }
+        while model.row_count() > cards.len() {
+            model.remove(model.row_count() - 1);
+        }
+    } else {
+        ui.set_cards(ModelRc::new(VecModel::from(cards)));
+    }
+    ui.set_completion_undo(store.completion.as_ref().is_some_and(|u| {
+        Instant::now() < u.deadline && store.data.notes.get(u.index) == Some(&u.after)
+    }));
     let next = reminders::next_delay(
         store
             .data
@@ -405,11 +535,161 @@ fn place(ui: &PocketWindow, pet: &PetWindow) {
         ));
     }
 }
+fn rgba_image(pixels: &image::RgbaImage) -> Image {
+    Image::from_rgba8(
+        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+        ),
+    )
+}
+fn capture_snap(ui: &PocketWindow, rect: [f32; 6], seed: u32) -> Result<SnapVisual> {
+    let started = Instant::now();
+    let scale = ui.window().scale_factor();
+    ui.set_capturing(true);
+    let frame_result = ui.window().take_snapshot();
+    ui.set_capturing(false);
+    let frame = frame_result?;
+    let [x, y, w, h, clip_top, clip_bottom] = rect;
+    if !rect.iter().all(|v| v.is_finite()) || w < 1. || h < 1. || scale <= 0. {
+        return Err("卡片坐标无效".into());
+    }
+    let left = (x * scale).round().clamp(0., frame.width() as f32) as u32;
+    let top = (y.max(clip_top) * scale)
+        .round()
+        .clamp(0., frame.height() as f32) as u32;
+    let right = ((x + w) * scale).round().clamp(0., frame.width() as f32) as u32;
+    let bottom = ((y + h).min(clip_bottom) * scale)
+        .round()
+        .clamp(0., frame.height() as f32) as u32;
+    if right <= left || bottom <= top {
+        return Err("卡片已不在可见区域".into());
+    }
+    let mut crop = image::RgbaImage::new(right - left, bottom - top);
+    for py in 0..crop.height() {
+        for px in 0..crop.width() {
+            let local_x = (left + px) as f32 / scale - x;
+            let local_y = (top + py) as f32 / scale - y;
+            let radius = 16f32.min(w / 2.).min(h / 2.);
+            let dx = local_x - local_x.clamp(radius, w - radius);
+            let dy = local_y - local_y.clamp(radius, h - radius);
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let offset =
+                (((top + py) as usize * frame.width() as usize) + (left + px) as usize) * 4;
+            crop.put_pixel(
+                px,
+                py,
+                image::Rgba(frame.as_bytes()[offset..offset + 4].try_into()?),
+            );
+        }
+    }
+    let width = crop.width() as f32 / scale;
+    let height = crop.height() as f32 / scale;
+    let split = snap::split(crop, seed);
+    let bytes = split.backdrop.as_raw().len() * (snap::LAYERS + 1);
+    let backdrop = rgba_image(&split.backdrop);
+    let layers = split
+        .layers
+        .into_iter()
+        .enumerate()
+        .map(|(i, pixels)| DustLayer {
+            picture: rgba_image(&pixels),
+            delay: i as f32 / (snap::LAYERS - 1) as f32 * 0.36,
+            drift_x: 38. + ((i * 17 + 7) % 43) as f32,
+            drift_y: -18. - ((i * 13 + 3) % 35) as f32,
+            swirl: ((i * 11 % 15) as f32) - 7.,
+        })
+        .collect::<Vec<_>>();
+    Ok(SnapVisual {
+        backdrop,
+        layers: ModelRc::new(VecModel::from(layers)),
+        x: left as f32 / scale - x,
+        y: top as f32 / scale - y,
+        width,
+        height,
+        running: false,
+        bytes,
+        prepare_ms: started.elapsed().as_secs_f64() * 1000.,
+    })
+}
+fn finish_snap_later(
+    ui: &PocketWindow,
+    pet: &PetWindow,
+    state: Rc<RefCell<Store>>,
+    i: usize,
+    deadline: Instant,
+) {
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    let phase_state = state.clone();
+    Timer::single_shot(Duration::from_millis(1160), move || {
+        let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+            return;
+        };
+        let mut s = phase_state.borrow_mut();
+        if let Some((_, collapse, token)) = s.finishing.get_mut(&i) {
+            if *token == deadline {
+                *collapse = true;
+            }
+        }
+        sync(&ui, &pet, &mut s);
+    });
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    Timer::single_shot(Duration::from_millis(1380), move || {
+        let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+            return;
+        };
+        let mut s = state.borrow_mut();
+        if s.finishing
+            .get(&i)
+            .is_some_and(|(_, _, token)| *token == deadline)
+        {
+            s.finishing.remove(&i);
+            s.snaps.remove(&i);
+            s.snap_rects.remove(&i);
+            if ui.get_expanded_id() == i as i32 {
+                ui.set_expanded_id(-1);
+            }
+        }
+        sync(&ui, &pet, &mut s);
+        place(&ui, &pet);
+        pet.set_happy(false);
+        pet.set_celebrating(false);
+    });
+}
+fn nudge(pet: &PetWindow, message: String) {
+    let token = pet.get_nudge_token().wrapping_add(1);
+    pet.set_nudge_token(token);
+    pet.set_nudge_text(message.into());
+    pet.set_nudging(true);
+    let weak = pet.as_weak();
+    Timer::single_shot(Duration::from_millis(450), move || {
+        if let Some(p) = weak.upgrade() {
+            if p.get_nudge_token() == token {
+                p.set_nudging(false);
+            }
+        }
+    });
+    let weak = pet.as_weak();
+    Timer::single_shot(Duration::from_secs(7), move || {
+        if let Some(p) = weak.upgrade() {
+            if p.get_nudge_token() == token {
+                p.set_nudge_text("".into());
+                p.set_nudging(false);
+            }
+        }
+    });
+}
 fn reveal(ui: &PocketWindow, pet: &PetWindow) {
     let _ = ui.show();
     place(ui, pet);
     ui.set_reminder_options(false);
     ui.set_revealed(true);
+    ui.invoke_viewed();
     if !ui.get_task_view() {
         ui.set_focus_token(ui.get_focus_token() + 1);
     }
@@ -654,6 +934,47 @@ fn run() -> Result<()> {
     sync(&ui, &pet, &mut store.borrow_mut());
     let save_timer = Rc::new(Timer::default());
     let toast_timer = Rc::new(Timer::default());
+    let attention_clock = Instant::now();
+    let attention = Rc::new(RefCell::new(attention::Attention::new(0)));
+    {
+        let policy = attention.clone();
+        let animal = pet.as_weak();
+        ui.on_viewed(move || {
+            policy
+                .borrow_mut()
+                .viewed(attention_clock.elapsed().as_secs());
+            if let Some(p) = animal.upgrade() {
+                p.set_nudge_token(p.get_nudge_token().wrapping_add(1));
+                p.set_nudge_text("".into());
+                p.set_nudging(false);
+            }
+        });
+    }
+    let attention_timer = Timer::default();
+    {
+        let policy = attention.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        attention_timer.start(TimerMode::Repeated, Duration::from_secs(30), move || {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let busy = pet.get_drop_busy()
+                || pet.get_drop_hover()
+                || !pet.get_toast().is_empty()
+                || pet.get_due_count() > 0
+                || ui.get_completion_undo();
+            if policy.borrow_mut().tick(
+                attention_clock.elapsed().as_secs(),
+                pet.get_count() > 0,
+                ui.get_revealed(),
+                busy,
+            ) {
+                nudge(&pet, format!("{} 件待办，空了看看", pet.get_count()));
+            }
+        });
+    }
+
     let import_result = std::sync::Arc::new(std::sync::Mutex::new(
         None::<std::result::Result<Note, String>>,
     ));
@@ -917,28 +1238,141 @@ fn run() -> Result<()> {
     {
         let state = store.clone();
         let weak = ui.as_weak();
+        ui.on_begin_completion(move |id, x, y, w, h, top, bottom| {
+            if let Some(ui) = weak.upgrade() {
+                {
+                    let mut s = state.borrow_mut();
+                    if s.finishing.contains_key(&(id as usize)) {
+                        return;
+                    }
+                    if s.data.notes.get(id as usize).is_some_and(|n| !n.done) {
+                        s.snap_rects.insert(id as usize, [x, y, w, h, top, bottom]);
+                    }
+                }
+                ui.invoke_toggle(id);
+            }
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
         let animal = pet.as_weak();
         ui.on_toggle(move |id| {
-            if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                let mut s = state.borrow_mut();
-                let i = id as usize;
-                if i >= s.data.notes.len() {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let i = id as usize;
+            let mut s = state.borrow_mut();
+            if s.finishing.contains_key(&i) {
+                return;
+            }
+            let Some(note) = s.data.notes.get(i) else {
+                return;
+            };
+            if note.done {
+                if let Err(e) = s.toggle_note(i) {
+                    report(&ui, e);
                     return;
-                }
-                if let Err(error) = s.toggle_note(i) {
-                    report(&ui, error);
-                    return;
-                }
-                if pet.get_can_undo() && s.undo.is_none() {
-                    pet.set_can_undo(false);
-                    pet.set_toast("记录已更新".into());
-                }
-                if ui.get_expanded_id() == id {
-                    ui.set_expanded_id(-1);
                 }
                 sync(&ui, &pet, &mut s);
                 place(&ui, &pet);
+                return;
             }
+            if let Err(e) = s.complete(i) {
+                report(&ui, e);
+                return;
+            }
+            let deadline = s.completion.as_ref().unwrap().deadline;
+
+            pet.set_can_undo(false);
+            let all_done = s.data.notes.iter().all(|n| n.done);
+            ui.set_notice(
+                if all_done {
+                    "都收拾好啦"
+                } else {
+                    "完成一件，轻松一点"
+                }
+                .into(),
+            );
+            pet.set_happy(true);
+            pet.set_celebrating(all_done);
+            sync(&ui, &pet, &mut s);
+            if s.snaps.len() < 3 {
+                if let Some(rect) = s.snap_rects.get(&i).copied() {
+                    match capture_snap(&ui, rect, id as u32) {
+                        Ok(visual) => {
+                            s.snaps.insert(i, visual);
+                        }
+                        Err(e) => {
+                            ui.set_notice(format!("已完成（动画未加载：{e}）").into());
+                        }
+                    }
+                }
+            }
+            sync(&ui, &pet, &mut s);
+            if std::env::args().any(|a| a == "--snapshot") {
+                if let Some(v) = s.snaps.get(&i) {
+                    let _ = fs::write(
+                        s.dir.join("snap-metrics.txt"),
+                        format!(
+                            "layers={} raw_bytes={} capture_and_split_ms={:.2}",
+                            snap::LAYERS,
+                            v.bytes,
+                            v.prepare_ms
+                        ),
+                    );
+                }
+            }
+            let weak = ui.as_weak();
+            let animal = pet.as_weak();
+            let moving_state = state.clone();
+            Timer::single_shot(Duration::from_millis(32), move || {
+                let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                    return;
+                };
+                let mut s = moving_state.borrow_mut();
+                if s.finishing
+                    .get(&i)
+                    .is_some_and(|(_, _, token)| *token == deadline)
+                {
+                    if let Some(visual) = s.snaps.get_mut(&i) {
+                        visual.running = true;
+                    }
+                    sync(&ui, &pet, &mut s);
+                }
+            });
+            finish_snap_later(&ui, &pet, state.clone(), i, deadline);
+            let weak = ui.as_weak();
+            let state = state.clone();
+            Timer::single_shot(UNDO_DURATION, move || {
+                if let Some(ui) = weak.upgrade() {
+                    let mut s = state.borrow_mut();
+                    if s.completion
+                        .as_ref()
+                        .is_some_and(|u| u.deadline == deadline)
+                    {
+                        s.completion = None;
+                        ui.set_completion_undo(false);
+                    }
+                }
+            });
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        ui.on_undo_complete(move || {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            match s.undo_completion() {
+                Ok(()) => ui.set_notice("已恢复待办和原来的提醒".into()),
+                Err(e) => report(&ui, e),
+            }
+            sync(&ui, &pet, &mut s);
+            place(&ui, &pet);
         });
     }
     {
@@ -1364,7 +1798,7 @@ fn run() -> Result<()> {
                                     Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, independent inline edit, Escape draft persistence".to_string(),
                                     Err(e) => format!("FAIL: {e}"),
                                 });
-                                start_reminder_check(&ui, &pet, state.clone());
+                                start_completion_check(&ui, &pet, state.clone());
                             }
                         });
                     }
@@ -1478,6 +1912,105 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
     }
     Ok(())
 }
+fn start_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<Store>>) {
+    {
+        let mut s = state.borrow_mut();
+        let demo = image::RgbaImage::from_fn(180, 110, |x, y| {
+            if y < 22 {
+                image::Rgba([55, 80, 115, 255])
+            } else if y > 45 && y < 92 && x > 18 && x < 155 && x % 35 < 22 {
+                image::Rgba([70 + (x % 100) as u8, 155, 190, 255])
+            } else {
+                image::Rgba([233, 240, 247, 255])
+            }
+        });
+        let name = "snap-demo.png";
+        demo.save(s.dir.join("images").join(name)).unwrap();
+        if let Some(note) = s.data.notes.last_mut() {
+            note.text = "确认这张截图，发给同事".into();
+            note.images = vec![name.into()];
+        }
+        s.flush().unwrap();
+        sync(ui, pet, &mut s);
+    }
+    reveal(ui, pet);
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    Timer::single_shot(Duration::from_millis(250), move || {
+        if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
+            run_completion_check(&ui, &pet, state);
+        }
+    });
+}
+fn run_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<Store>>) {
+    let id = (state.borrow().data.notes.len() - 1) as i32;
+    ui.set_completion_request(id);
+    let weak = ui.as_weak();
+    let state_check = state.clone();
+    let prepared = Rc::new(Cell::new(false));
+    let prepared_check = prepared.clone();
+    Timer::single_shot(Duration::from_millis(100), move || {
+        if let Some(ui) = weak.upgrade() {
+            let s = state_check.borrow();
+            prepared_check.set(
+                s.snaps
+                    .get(&(id as usize))
+                    .is_some_and(|v| v.bytes > 0 && v.running),
+            );
+            if !prepared_check.get() {
+                let _ = fs::write(
+                    s.dir.join("snap-error.txt"),
+                    format!("Missing pixel layers: {}", ui.get_notice()),
+                );
+            }
+        }
+    });
+    for (delay, name) in [
+        (420, "completion-dust.png"),
+        (850, "completion-late.png"),
+        (1240, "completion-collapse.png"),
+    ] {
+        let weak = ui.as_weak();
+        let out = state.borrow().dir.clone();
+        Timer::single_shot(Duration::from_millis(delay), move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = snapshot_window(ui.window(), &out.join(name));
+            }
+        });
+    }
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    Timer::single_shot(Duration::from_millis(1600), move || {
+        let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+            return;
+        };
+        let result = (|| -> Result<()> {
+            if !prepared.get()
+                || !state.borrow().snaps.is_empty()
+                || !state.borrow().data.notes[id as usize].done
+                || !state.borrow().finishing.is_empty()
+            {
+                return Err("completion timer failed".into());
+            }
+            ui.invoke_undo_complete();
+            if state.borrow().data.notes[id as usize].done {
+                return Err("completion undo failed".into());
+            }
+            nudge(&pet, "3 件待办，空了看看".into());
+            snapshot_window(pet.window(), &state.borrow().dir.join("attention-pet.png"))?;
+            Ok(())
+        })();
+        let _ = fs::write(
+            state.borrow().dir.join("completion-check.txt"),
+            match result {
+                Ok(()) => "PASS: real pixel layers, timed collapse, image buffer release, undo and attention rendering".into(),
+                Err(e) => format!("FAIL: {e}"),
+            },
+        );
+        hide(&ui);
+        start_reminder_check(&ui, &pet, state);
+    });
+}
 fn start_reminder_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<Store>>) {
     let out = state.borrow().dir.clone();
     {
@@ -1569,6 +2102,74 @@ mod tests {
         }
         fs::remove_dir(dir.join("images")).unwrap();
         fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn multiple_completions_undo_only_latest_and_recompletion_has_new_token() {
+        let mut s = temporary_store();
+        for text in ["first", "second"] {
+            s.data.notes.push(Note {
+                text: text.into(),
+                ..Note::default()
+            });
+        }
+        s.flush().unwrap();
+        s.complete(0).unwrap();
+        s.complete(1).unwrap();
+        let old = s.finishing[&1].2;
+        s.undo_completion().unwrap();
+        assert!(s.data.notes[0].done);
+        assert!(!s.data.notes[1].done);
+        assert!(s.finishing.contains_key(&0));
+        assert!(!s.finishing.contains_key(&1));
+        s.complete(1).unwrap();
+        assert_ne!(s.finishing[&1].2, old);
+        cleanup_store(&s.dir);
+    }
+    #[test]
+    fn completion_is_durable_and_undo_restores_reminder_without_touching_draft() {
+        let mut s = temporary_store();
+        s.buffer.text = "keep my draft".into();
+        s.data.notes.push(Note {
+            text: "finish me".into(),
+            remind_at: Some(12345),
+            ..Note::default()
+        });
+        s.flush().unwrap();
+        s.complete(0).unwrap();
+        let loaded = Store::load(s.dir.clone()).unwrap();
+        assert!(loaded.data.notes[0].done);
+        assert_eq!(loaded.data.notes[0].remind_at, None);
+        assert!(s.complete(0).is_err());
+        s.undo_completion().unwrap();
+        let loaded = Store::load(s.dir.clone()).unwrap();
+        assert!(!loaded.data.notes[0].done);
+        assert_eq!(loaded.data.notes[0].remind_at, Some(12345));
+        assert_eq!(loaded.data.draft.text, "keep my draft");
+        assert!(s.finishing.is_empty());
+        cleanup_store(&s.dir);
+    }
+    #[test]
+    fn failed_completion_and_expired_or_modified_undo_are_safe() {
+        let mut s = temporary_store();
+        s.data.notes.push(Note {
+            text: "test".into(),
+            ..Note::default()
+        });
+        s.flush().unwrap();
+        fs::create_dir(s.dir.join("state.tmp")).unwrap();
+        assert!(s.complete(0).is_err());
+        assert!(!s.data.notes[0].done);
+        assert!(s.finishing.is_empty());
+        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
+        s.complete(0).unwrap();
+        s.completion.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert!(s.undo_completion().is_err());
+        assert!(s.data.notes[0].done);
+        s.completion.as_mut().unwrap().deadline = Instant::now() + UNDO_DURATION;
+        s.update_record(0, |n| n.text = "changed".into()).unwrap();
+        assert!(s.undo_completion().is_err());
+        assert_eq!(s.data.notes[0].text, "changed");
+        cleanup_store(&s.dir);
     }
     #[test]
     fn inline_edit_preserves_draft_and_rolls_back_failed_save() {
@@ -1670,10 +2271,8 @@ mod tests {
         cleanup_store(&s.dir);
     }
     fn temporary_store() -> Store {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Store::load(
             std::env::temp_dir().join(format!("pocket-capture-{}-{suffix}", std::process::id())),
         )

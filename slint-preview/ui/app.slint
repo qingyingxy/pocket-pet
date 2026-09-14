@@ -1,6 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 
-export struct CardData { id:int, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
+export struct DustLayer { picture:image, delay:float, drift-x:float, drift-y:float, swirl:float }
+export struct CardData { id:int, snap-ready:bool, snap-running:bool, snap-layers:[DustLayer], snap-backdrop:image, snap-x:float, snap-y:float, snap-width:float, snap-height:float, frozen-height:float, dissolving:bool, collapsing:bool, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
 
 component Action inherits Rectangle {
     in property<string> label;
@@ -21,6 +22,10 @@ export component PetWindow inherits Window {
     in property<int> count;
     in property<int> due-count;
     in property<bool> happy:false;
+    in property<bool> celebrating:false;
+    in property<bool> nudging:false;
+    in property<string> nudge-text;
+    in-out property<int> nudge-token;
     in property<bool> drop-hover:false;
     in property<bool> drop-busy:false;
     Rectangle{x:8px;y:2px;width:150px;height:128px;border-radius:30px;background:root.drop-hover?#30edbc84:transparent;border-width:root.drop-hover?2px:0px;border-color:#dfa066;animate background{duration:100ms;}}
@@ -31,7 +36,7 @@ export component PetWindow inherits Window {
     callback open-record(); callback open-tasks(); callback drag(float,float); callback drag-finished();
     private property<length> origin-x; private property<length> origin-y;
     private property<bool> was-dragged:false;
-    Image { source:@image-url("cat.svg"); x:19px; y:root.happy ? 0px : 7px; width:128px; height:128px; image-fit:contain; animate y {duration:170ms;easing:ease-out;} }
+    Image { source:@image-url("cat.svg"); x:root.celebrating?13px:19px; y:root.happy || root.nudging ? 0px : 7px; width:root.celebrating?140px:128px; height:root.celebrating?120px:128px; animate width {duration:240ms;} animate height {duration:240ms;} animate x {duration:240ms;} image-fit:contain; animate y {duration:170ms;easing:ease-out;} }
     TouchArea { x:12px;y:0px;width:142px;height:133px;mouse-cursor:pointer;
         pointer-event(event)=>{
             if event.kind == PointerEventKind.down {root.origin-x=self.mouse-x;root.origin-y=self.mouse-y;root.was-dragged=false;}
@@ -44,9 +49,9 @@ export component PetWindow inherits Window {
         }}
         clicked=>{if !root.was-dragged {root.open-record();}}
     }
-    Rectangle {x:root.drop-hover||root.drop-busy||root.toast!=""||root.due-count>0?6px:31px;y:137px;width:root.drop-hover||root.drop-busy||root.toast!=""||root.due-count>0?154px:104px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
+    Rectangle {x:root.drop-hover||root.drop-busy||root.toast!=""||root.nudge-text!=""||root.due-count>0?6px:31px;y:137px;width:root.drop-hover||root.drop-busy||root.toast!=""||root.nudge-text!=""||root.due-count>0?154px:104px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
         animate background {duration:120ms;}
-        Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
+        Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.nudge-text!=""?root.nudge-text:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
         TouchArea {mouse-cursor:pointer;clicked=>{if root.drop-hover||root.drop-busy {} else if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
     }
 }
@@ -61,6 +66,12 @@ export component PocketWindow inherits Window {
     callback inline-reminder(int,int);
 
     callback inline-remove(int);
+    callback begin-completion(int,float,float,float,float,float,float);
+    in property<int> completion-request:-1;
+    in property<bool> capturing:false;
+    callback viewed();
+    callback undo-complete();
+    in property<bool> completion-undo:false;
     in property<int> focus-token;
     in property<string> reminder-label;
     in property<string> later-label;
@@ -146,12 +157,25 @@ export component PocketWindow inherits Window {
                     Rectangle{horizontal-stretch:1;}
                     Text{text:root.pending-count + " 件待处理";font-size:12px;color:#ad8b73;vertical-alignment:center;}
                 }
-                ScrollView {vertical-stretch:1;
+                task-scroll:=ScrollView {vertical-stretch:1;vertical-scrollbar-policy:root.capturing?ScrollBarPolicy.always-off:ScrollBarPolicy.as-needed;horizontal-scrollbar-policy:root.capturing?ScrollBarPolicy.always-off:ScrollBarPolicy.as-needed;
                     VerticalLayout {spacing:10px;
-                        for card in root.cards : Rectangle {height:root.expanded-id==card.id?(card.has-image||card.file-count>0?282px:226px):card.due?132px:card.has-image?98px:84px;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:card.due?#ddb68f:#eee4d9;
-                            Rectangle{x:14px;y:18px;width:22px;height:22px;border-radius:11px;border-width:1px;border-color:card.done?#b7c5a6:#d2bdab;background:card.done?#e5ecdd:#fffdf9;
-                                Text{text:card.done?"✓":"";color:#73935a;horizontal-alignment:center;vertical-alignment:center;}
-                                TouchArea{mouse-cursor:pointer;clicked=>{root.toggle(card.id);}}
+                        for card in root.cards : card-shell:=Rectangle {
+                            private property<length> base-height:card.dissolving && card.frozen-height>0 ? card.frozen-height*1px : root.expanded-id==card.id?(card.has-image||card.file-count>0?282px:226px):card.due?132px:card.has-image?98px:84px;
+                            private property<float> dust:card.snap-running?1:0;
+                            in property<int> requested:root.completion-request;
+                            function begin() {
+                                root.begin-completion(card.id,self.absolute-position.x/1px,self.absolute-position.y/1px,self.width/1px,self.height/1px,task-scroll.absolute-position.y/1px,(task-scroll.absolute-position.y+task-scroll.height)/1px);
+                            }
+                            changed requested=>{if self.requested==card.id {self.begin();}}
+                            animate dust {duration:1100ms;easing:linear;}
+                            height:card.collapsing?0px:self.base-height;
+                            animate height {duration:200ms;easing:ease-in-out;}
+                            clip:false;
+                            Rectangle {x:0px;y:0px;width:parent.width;height:parent.height;clip:true;opacity:card.snap-ready?0:1;
+                              Rectangle {x:0px;y:0px;width:card-shell.width;height:card-shell.base-height;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:card.due?#ddb68f:#eee4d9;
+                            Rectangle{x:14px;y:18px;width:22px;height:22px;border-radius:11px;border-width:1px;border-color:card.done||card.dissolving?#b7c5a6:#d2bdab;background:card.done||card.dissolving?#e5ecdd:#fffdf9;
+                                if card.done || card.dissolving : Image{x:4px;y:4px;width:14px;height:14px;source:@image-url("check.svg");image-fit:contain;}
+                                TouchArea{enabled:!card.dissolving;mouse-cursor:pointer;clicked=>{card-shell.begin();}}
                             }
                             if root.expanded-id!=card.id : Text{x:48px;y:14px;width:parent.width - (card.has-image?142px:66px);height:40px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
                             if root.expanded-id!=card.id : Text{x:48px;y:card.due?64px:parent.height - 22px;text:card.done?"已经完成":card.reminder!=""?card.reminder:"点击补充内容";font-size:11px;color:#b39c88;}
@@ -195,6 +219,18 @@ export component PocketWindow inherits Window {
                                 Action{label:"30 分钟后";height:28px;clicked=>{root.snooze(card.id);}}
                                 Action{label:"知道了";height:28px;quiet:true;clicked=>{root.acknowledge(card.id);}}
                             }
+                        }                            }
+                            if card.snap-ready && !root.capturing : Rectangle {x:0px;y:0px;width:parent.width;height:card-shell.base-height;
+                                Image {x:card.snap-x*1px;y:card.snap-y*1px;width:card.snap-width*1px;height:card.snap-height*1px;source:card.snap-backdrop;image-fit:fill;opacity:1 - min(1,max(0,(card-shell.dust - 0.12)/0.7));}
+                                for layer in card.snap-layers : Image {
+                                    private property<float> flight:max(0,min(1,(card-shell.dust - layer.delay)/(1 - layer.delay)));
+                                    x:card.snap-x*1px + (layer.drift-x*self.flight + Math.sin(self.flight*360deg)*layer.swirl*self.flight)*1px;
+                                    y:card.snap-y*1px + (layer.drift-y*self.flight - Math.sin(self.flight*180deg)*6)*1px;
+                                    width:card.snap-width*1px;height:card.snap-height*1px;
+                                    source:layer.picture;image-fit:fill;opacity:1 - self.flight*self.flight;
+                                }
+                            }
+                            if card.dissolving : TouchArea {}
                         }
                         if root.cards.length==0 : Rectangle{height:80px;Text{text:"还没有待办，在上面记下第一件事。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
                     }
@@ -205,6 +241,7 @@ export component PocketWindow inherits Window {
                 Rectangle {width:5px;height:5px;border-radius:3px;background:root.notice!=""?#dca875:#adc19b;}
                 Text{text:root.notice!=""?root.notice:"Enter 收下 · 点击记录展开";color:#b39e8c;font-size:11px;vertical-alignment:center;}
                 Rectangle{horizontal-stretch:1;}
+                if root.completion-undo : Action{label:"撤销完成";quiet:true;width:64px;height:20px;clicked=>{root.undo-complete();}}
                 Action{label:"退出";quiet:true;width:36px;height:20px;clicked=>{root.quit();}}
             }
         }
