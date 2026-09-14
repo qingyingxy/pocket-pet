@@ -16,9 +16,10 @@ cargo build --release --manifest-path slint-preview/Cargo.toml
 已构建时可直接双击该 exe。Cargo 不在 PATH 时，可用 `& "$env:USERPROFILE\.cargo\bin\cargo.exe"` 替代命令中的 `cargo`。
 
 - **点小猫**：直接输入；Ctrl+V 粘贴文字或截图。
-- **Enter**：收下；Shift+Enter 换行。
+- **拖到小猫上**：收下所选文字、图片或本地文件；移出取消，同批文件合成一条记录。
+- **Enter**：收下后直接加入下方列表，面板保持展开；Shift+Enter 换行。
 - **Ctrl+Alt+V**：全局快捷收下剪贴板；6 秒内点击小猫下方提示可撤销。
-- **点待办数字**：查看、编辑、完成记录。
+- **点小猫或待办数字**：展开/收起同一面板，上方新增，下方查看、原位编辑和完成记录。
 - **不提醒 ▾**：可选 30 分钟后或今晚/明早提醒；到点后点小猫徽标查看，可稍后提醒或知晓。
 - **Esc / × / 切换其他窗口**：收起并保留草稿。
 
@@ -34,7 +35,7 @@ cargo build --release --manifest-path slint-preview/Cargo.toml
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 功能进度、验证边界与后续路线 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 目录结构、事件和数据流程 |
 
-当前已完成输入气泡简化、快捷收下与撤销、轻提醒；拖放尚未实现。
+当前已实现输入气泡简化、快捷收下与撤销、轻提醒、拖放收下。
 
 ## 验证
 

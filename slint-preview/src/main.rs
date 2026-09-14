@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Image, ModelRc, PhysicalPosition, Timer, TimerMode, VecModel};
+use std::os::windows::ffi::OsStrExt;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -12,13 +13,23 @@ use std::{
 };
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 slint::include_modules!();
+mod clipboard;
+mod drop_import;
+mod drop_target;
 mod hotkey;
 mod reminders;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Attachment {
+    name: String,
+    path: String,
+}
 #[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Note {
     text: String,
     images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<Attachment>,
     done: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remind_at: Option<u64>,
@@ -69,8 +80,8 @@ impl Store {
         save_data(&self.dir, &self.data)
     }
     fn capture_note(&mut self, note: Note) -> Result<()> {
-        if note.text.trim().is_empty() && note.images.is_empty() {
-            return Err("剪贴板没有可收下的内容".into());
+        if note.text.trim().is_empty() && note.images.is_empty() && note.files.is_empty() {
+            return Err("没有可收下的内容".into());
         }
         let before = self.data.clone();
         let index = self.data.notes.len();
@@ -164,14 +175,28 @@ impl Store {
         }
         Ok(())
     }
+    fn update_record(&mut self, index: usize, update: impl FnOnce(&mut Note)) -> Result<()> {
+        let old = self.data.notes.get(index).ok_or("记录不存在")?.clone();
+        update(&mut self.data.notes[index]);
+        if let Err(e) = save_data(&self.dir, &self.data) {
+            self.data.notes[index] = old;
+            return Err(e);
+        }
+        Ok(())
+    }
     fn thumbnail(&mut self, name: &str) -> Image {
         if let Some(image) = self.cache.get(name) {
             return image.clone();
         }
         let result = (|| -> Result<Image> {
-            let image = image::open(self.dir.join("images").join(name))?
-                .thumbnail(240, 160)
-                .to_rgba8();
+            let mut reader = image::ImageReader::open(self.dir.join("images").join(name))?
+                .with_guessed_format()?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            limits.max_image_width = Some(16384);
+            limits.max_image_height = Some(16384);
+            reader.limits(limits);
+            let image = reader.decode()?.thumbnail(240, 160).to_rgba8();
             let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
                 image.as_raw(),
                 image.width(),
@@ -187,17 +212,16 @@ impl Store {
         result
     }
     fn clipboard_image(&self) -> Result<Option<Note>> {
-        let mut clipboard = arboard::Clipboard::new()?;
-        if let Ok(image) = clipboard.get_image() {
+        if let Some(image) = clipboard::read_image()? {
             let name = format!(
                 "{}.png",
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
             );
             image::save_buffer(
                 self.dir.join("images").join(&name),
-                &image.bytes,
-                image.width as u32,
-                image.height as u32,
+                image.as_raw(),
+                image.width(),
+                image.height(),
                 image::ColorType::Rgba8,
             )?;
             return Ok(Some(Note {
@@ -205,6 +229,7 @@ impl Store {
                 images: vec![name],
                 done: false,
                 remind_at: None,
+                files: vec![],
             }));
         }
         Ok(None)
@@ -223,6 +248,7 @@ impl Store {
             images: vec![],
             done: false,
             remind_at: None,
+            files: vec![],
         })
     }
 }
@@ -247,7 +273,8 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
     );
     ui.set_draft(store.buffer.text.clone().into());
     ui.set_editing(store.selected.is_some());
-    ui.set_has_attachment(!store.buffer.images.is_empty());
+    ui.set_has_attachment(!store.buffer.images.is_empty() || !store.buffer.files.is_empty());
+    ui.set_file_count(store.buffer.files.len() as i32);
     ui.set_attachment_count(store.buffer.images.len() as i32);
     ui.set_attachment(
         store
@@ -282,10 +309,20 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
             .unwrap_or_default();
         cards.push(CardData {
             id: i as i32,
-            body: n.text.into(),
+            body: if n.text.is_empty() && !n.files.is_empty() {
+                n.files
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+                    .into()
+            } else {
+                n.text.into()
+            },
             preview,
             has_image: !n.images.is_empty(),
             image_count: n.images.len() as i32,
+            file_count: n.files.len() as i32,
             done: n.done,
             due: reminders::is_due(n.remind_at, n.done, now),
             reminder: if n.done || n.remind_at.is_none() {
@@ -406,10 +443,88 @@ fn toast(pet: &PetWindow, timer: &Timer, text: &str, undo: bool, error: bool) {
         }
     });
 }
+async fn create_drop_target(
+    ui: &PocketWindow,
+    pet: &PetWindow,
+    store: &Rc<RefCell<Store>>,
+    import_result: &std::sync::Arc<std::sync::Mutex<Option<std::result::Result<Note, String>>>>,
+    toast_timer: &Rc<Timer>,
+) -> Result<Option<drop_target::Registration>> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let native = pet.window().winit_window().await?;
+    let hwnd = match native.window_handle()?.as_raw() {
+        RawWindowHandle::Win32(h) => windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _),
+        _ => return Err("无法取得小猫窗口句柄".into()),
+    };
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    let result = import_result.clone();
+    let dir = store.borrow().dir.clone();
+    let timer = toast_timer.clone();
+    Ok(
+        match drop_target::Registration::new(hwnd, move |event| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return false;
+            };
+            match event {
+                drop_target::Event::Hover(active) => {
+                    pet.set_drop_hover(active && !pet.get_drop_busy());
+                    !pet.get_drop_busy()
+                }
+                drop_target::Event::Dropped(payload) => {
+                    if pet.get_drop_busy() {
+                        return false;
+                    }
+                    let payload = match payload {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            ui.set_notice(format!("未收下：{error}").into());
+                            toast(&pet, &timer, "未收下 · 点击查看", false, true);
+                            return false;
+                        }
+                    };
+                    pet.set_drop_busy(true);
+                    ui.set_drop_busy(true);
+                    let result = result.clone();
+                    let dir = dir.clone();
+                    let weak = weak.clone();
+                    let spawn = std::thread::Builder::new()
+                        .name("drop-import".into())
+                        .spawn(move || {
+                            let imported = drop_import::import(payload, &dir);
+                            *result.lock().unwrap() = Some(imported);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = weak.upgrade() {
+                                    ui.invoke_drop_ready();
+                                }
+                            });
+                        });
+                    if let Err(error) = spawn {
+                        pet.set_drop_busy(false);
+                        ui.set_drop_busy(false);
+                        ui.set_notice(format!("无法开始收下：{error}").into());
+                        toast(&pet, &timer, "未收下 · 点击查看", false, true);
+                        return false;
+                    }
+                    true
+                }
+            }
+        }) {
+            Ok(registration) => Some(registration),
+            Err(error) => {
+                ui.set_notice(format!("拖放不可用：{error}").into());
+                toast(&pet, &toast_timer, "拖放不可用 · 查看", false, true);
+                None
+            }
+        },
+    )
+}
 fn run() -> Result<()> {
+    use winit::platform::windows::WindowAttributesExtWindows;
     slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name("software".into())
+        .with_winit_window_attributes_hook(|attributes| attributes.with_drag_and_drop(false))
         .select()?;
     let snapshot = std::env::args().any(|a| a == "--snapshot");
     let dir = if snapshot {
@@ -539,6 +654,99 @@ fn run() -> Result<()> {
     sync(&ui, &pet, &mut store.borrow_mut());
     let save_timer = Rc::new(Timer::default());
     let toast_timer = Rc::new(Timer::default());
+    let import_result = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<std::result::Result<Note, String>>,
+    ));
+    {
+        let result = import_result.clone();
+        let state = store.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let timer = toast_timer.clone();
+        ui.on_drop_ready(move || {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            ui.set_drop_busy(false);
+            pet.set_drop_busy(false);
+            let Some(result) = result.lock().unwrap().take() else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            match result.and_then(|note| {
+                let copy = note.clone();
+                s.capture_note(note).map_err(|e| {
+                    drop_import::discard(&copy, &s.dir);
+                    e.to_string()
+                })
+            }) {
+                Ok(()) => {
+                    sync(&ui, &pet, &mut s);
+                    ui.set_notice("拖入内容已收下".into());
+                    toast(&pet, &timer, "已收下 · 点击撤销", true, false);
+                    pet.set_happy(true);
+                    let weak = pet.as_weak();
+                    Timer::single_shot(Duration::from_millis(420), move || {
+                        if let Some(pet) = weak.upgrade() {
+                            pet.set_happy(false);
+                        }
+                    });
+                }
+                Err(error) => {
+                    ui.set_notice(format!("未收下：{error}").into());
+                    toast(&pet, &timer, "未收下 · 点击查看", false, true);
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = store.clone();
+        ui.on_show_files(move |id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let s = state.borrow();
+            if let Some(file) = (if id < 0 {
+                Some(&s.buffer)
+            } else {
+                s.data.notes.get(id as usize)
+            })
+            .and_then(|n| n.files.first())
+            {
+                let result = (|| -> Result<()> {
+                    let base = s.dir.join("files").canonicalize()?;
+                    let target = base.join(&file.path).canonicalize()?;
+                    if !target.starts_with(&base) {
+                        return Err("附件路径无效".into());
+                    }
+                    let folder = target.parent().ok_or("附件目录不可用")?;
+                    let text: Vec<u16> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
+                    use windows::{
+                        core::{w, PCWSTR},
+                        Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+                    };
+                    let result = unsafe {
+                        ShellExecuteW(
+                            None,
+                            w!("open"),
+                            PCWSTR(text.as_ptr()),
+                            PCWSTR::null(),
+                            PCWSTR::null(),
+                            SW_SHOWNORMAL,
+                        )
+                    };
+                    if result.0 as isize <= 32 {
+                        return Err("无法打开附件文件夹".into());
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    ui.set_notice(error.to_string().into());
+                }
+            }
+        });
+    }
     {
         let state = store.clone();
         let weak = ui.as_weak();
@@ -569,7 +777,10 @@ fn run() -> Result<()> {
                 return;
             };
             let mut s = state.borrow_mut();
-            if s.buffer.text.trim().is_empty() && s.buffer.images.is_empty() {
+            if s.buffer.text.trim().is_empty()
+                && s.buffer.images.is_empty()
+                && s.buffer.files.is_empty()
+            {
                 return;
             }
             let editing = s.selected.is_some();
@@ -597,12 +808,9 @@ fn run() -> Result<()> {
                 }
             });
             ui.set_notice("收好啦，继续安心做事吧".into());
-            if editing {
-                ui.set_task_view(true);
-                place(&ui, &pet);
-            } else {
-                hide(&ui);
-            }
+            ui.set_expanded_id(-1);
+            ui.set_focus_token(ui.get_focus_token() + 1);
+            place(&ui, &pet);
         });
     }
     {
@@ -693,7 +901,11 @@ fn run() -> Result<()> {
         ui.on_remove_image(move || {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                 let mut s = state.borrow_mut();
-                s.buffer.images.pop();
+                if !s.buffer.files.is_empty() {
+                    s.buffer.files.pop();
+                } else {
+                    s.buffer.images.pop();
+                }
                 if let Err(e) = s.flush() {
                     report(&ui, e);
                 }
@@ -721,8 +933,97 @@ fn run() -> Result<()> {
                     pet.set_can_undo(false);
                     pet.set_toast("记录已更新".into());
                 }
+                if ui.get_expanded_id() == id {
+                    ui.set_expanded_id(-1);
+                }
                 sync(&ui, &pet, &mut s);
+                place(&ui, &pet);
             }
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
+        ui.on_inline_text(move |id, text| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            if let Err(e) = s.update_record(id as usize, |note| note.text = text.into()) {
+                report(&ui, e);
+            } else {
+                ui.set_notice("修改已保存".into());
+            }
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        ui.on_inline_paste(move |id| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return false;
+            };
+            let mut s = state.borrow_mut();
+            match s.clipboard_image() {
+                Ok(Some(note)) => {
+                    if let Err(e) =
+                        s.update_record(id as usize, |n| n.images.extend(note.images.clone()))
+                    {
+                        drop_import::discard(&note, &s.dir);
+                        report(&ui, e);
+                    }
+                    sync(&ui, &pet, &mut s);
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    report(&ui, e);
+                    true
+                }
+            }
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        ui.on_inline_remove(move |id| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            if let Err(e) = s.update_record(id as usize, |n| {
+                if !n.files.is_empty() {
+                    n.files.pop();
+                } else {
+                    n.images.pop();
+                }
+            }) {
+                report(&ui, e);
+            }
+            sync(&ui, &pet, &mut s);
+        });
+    }
+    {
+        let state = store.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        ui.on_inline_reminder(move |id, preset| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let at = match preset {
+                0 => None,
+                1 => Some(reminders::now() + reminders::HALF_HOUR),
+                2 => reminders::later_today(chrono::Local::now()),
+                _ => return,
+            };
+            let mut s = state.borrow_mut();
+            if let Err(e) = s.set_reminder(id as usize, at) {
+                report(&ui, e);
+            }
+            sync(&ui, &pet, &mut s);
         });
     }
     {
@@ -732,22 +1033,24 @@ fn run() -> Result<()> {
         ui.on_edit(move |id| {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                 let mut s = state.borrow_mut();
-                if let Err(e) = s.flush() {
-                    report(&ui, e);
+                let Some(note) = s.data.notes.get(id as usize) else {
                     return;
+                };
+                if ui.get_expanded_id() == id {
+                    ui.set_expanded_id(-1);
+                    ui.set_focus_token(ui.get_focus_token() + 1);
+                } else {
+                    ui.set_edit_body(note.text.clone().into());
+                    ui.set_expanded_id(id);
+                    if s.undo
+                        .as_ref()
+                        .is_some_and(|undo| undo.index == id as usize)
+                    {
+                        s.undo = None;
+                        pet.set_can_undo(false);
+                        pet.set_toast("记录已保留".into());
+                    }
                 }
-                let i = id as usize;
-                if i >= s.data.notes.len() {
-                    return;
-                }
-                s.buffer = s.data.notes[i].clone();
-                if s.undo.as_ref().is_some_and(|undo| undo.index == i) {
-                    s.undo = None;
-                    pet.set_can_undo(false);
-                    pet.set_toast("记录已保留".into());
-                }
-                s.selected = Some(i);
-                ui.set_task_view(false);
                 sync(&ui, &pet, &mut s);
                 place(&ui, &pet);
             }
@@ -761,6 +1064,7 @@ fn run() -> Result<()> {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                 ui.set_show_done(!ui.get_show_done());
                 sync(&ui, &pet, &mut state.borrow_mut());
+                place(&ui, &pet);
             }
         });
     }
@@ -779,7 +1083,7 @@ fn run() -> Result<()> {
                     s.selected = None;
                     s.buffer = s.data.draft.clone();
                 }
-                ui.set_task_view(tasks);
+                ui.set_task_view(false);
                 sync(&ui, &pet, &mut s);
                 place(&ui, &pet);
             }
@@ -802,6 +1106,12 @@ fn run() -> Result<()> {
         let state = store.clone();
         let weak = ui.as_weak();
         ui.on_quit(move || {
+            if weak.upgrade().is_some_and(|ui| ui.get_drop_busy()) {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_notice("正在收下文件，请稍等再退出".into());
+                }
+                return;
+            }
             if let Err(e) = state.borrow_mut().flush() {
                 if let Some(ui) = weak.upgrade() {
                     report(&ui, e);
@@ -816,8 +1126,12 @@ fn run() -> Result<()> {
         let animal = pet.as_weak();
         pet.on_open_record(move || {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                ui.invoke_change_view(false);
-                reveal(&ui, &pet);
+                if ui.get_revealed() {
+                    ui.invoke_dismiss();
+                } else {
+                    ui.invoke_change_view(false);
+                    reveal(&ui, &pet);
+                }
             }
         });
     }
@@ -826,8 +1140,12 @@ fn run() -> Result<()> {
         let animal = pet.as_weak();
         pet.on_open_tasks(move || {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                ui.invoke_change_view(true);
-                reveal(&ui, &pet);
+                if ui.get_revealed() {
+                    ui.invoke_dismiss();
+                } else {
+                    ui.invoke_change_view(false);
+                    reveal(&ui, &pet);
+                }
             }
         });
     }
@@ -886,6 +1204,38 @@ fn run() -> Result<()> {
         }
     };
     pet.show()?;
+    let drop_guard = Rc::new(RefCell::new(None));
+    {
+        let holder = drop_guard.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let store = store.clone();
+        let import_result = import_result.clone();
+        let toast_timer = toast_timer.clone();
+        slint::spawn_local(async move {
+            if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
+                match create_drop_target(&ui, &pet, &store, &import_result, &toast_timer).await {
+                    Ok(registration) => {
+                        *holder.borrow_mut() = registration;
+                    }
+                    Err(error) => {
+                        ui.set_notice(format!("拖放不可用：{error}").into());
+                        toast(&pet, &toast_timer, "拖放不可用 · 查看", false, true);
+                    }
+                }
+                if snapshot {
+                    let _ = fs::write(
+                        store.borrow().dir.join("drop-registration.txt"),
+                        if holder.borrow().is_some() {
+                            "PASS: native drop target registered"
+                        } else {
+                            "FAIL: native drop target registration"
+                        },
+                    );
+                }
+            }
+        })?;
+    }
     place_at_startup(&pet);
     reveal(&ui, &pet);
     {
@@ -983,6 +1333,9 @@ fn run() -> Result<()> {
                 );
                 let result = snapshot_window(ui.window(), &out.join("record.png"))
                     .and_then(|_| snapshot_window(pet.window(), &out.join("pet.png")));
+                pet.set_drop_hover(true);
+                let _ = snapshot_window(pet.window(), &out.join("drop-hover.png"));
+                pet.set_drop_hover(false);
                 pet.set_toast("已收下 · 点击撤销".into());
                 pet.set_can_undo(true);
                 let _ = snapshot_window(pet.window(), &out.join("capture-toast.png"));
@@ -1008,7 +1361,7 @@ fn run() -> Result<()> {
                             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                                 let result = check_input_flow(&ui, &pet, &state);
                                 let _ = fs::write(out.join("input-check.txt"), match result {
-                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter save, Escape draft persistence".to_string(),
+                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, independent inline edit, Escape draft persistence".to_string(),
                                     Err(e) => format!("FAIL: {e}"),
                                 });
                                 start_reminder_check(&ui, &pet, state.clone());
@@ -1060,13 +1413,64 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
     if ui.get_draft() != "hello\nworld" {
         return Err("Shift+Enter did not insert newline".into());
     }
+    if std::env::args().any(|arg| arg == "--clipboard-check") {
+        let before = store.borrow().buffer.images.len();
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
+        press(ui, "v".into());
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
+        if store.borrow().buffer.images.len() != before + 1 {
+            return Err(format!("Ctrl+V image paste failed: {}", ui.get_notice()).into());
+        }
+        if ui.get_draft() != "hello\nworld" {
+            return Err("image paste changed draft text".into());
+        }
+        let saved = Store::load(store.borrow().dir.clone())?;
+        if saved.data.draft.images.len() != before + 1 {
+            return Err("pasted image not persisted".into());
+        }
+        fs::write(
+            store.borrow().dir.join("clipboard-check.txt"),
+            "PASS: Ctrl+V received clipboard image, preserved text and persisted attachment",
+        )?;
+    }
     let count = store.borrow().data.notes.len();
     press(ui, Key::Return.into());
-    if store.borrow().data.notes.len() != count + 1 || ui.get_revealed() {
-        return Err("Enter did not save and dismiss".into());
+    if store.borrow().data.notes.len() != count + 1 || !ui.get_revealed() {
+        return Err("Enter did not save and keep the unified panel open".into());
     }
     reveal(ui, pet);
     press(ui, "unfinished".into());
+    let id = count as i32;
+    ui.invoke_edit(id);
+    if ui.get_expanded_id() != id || ui.get_draft() != "unfinished" {
+        return Err("inline edit replaced the new-record draft".into());
+    }
+    ui.set_edit_body("edited in place".into());
+    ui.invoke_inline_text(id, "edited in place".into());
+    let saved = Store::load(store.borrow().dir.clone())?;
+    if saved.data.notes[id as usize].text != "edited in place"
+        || store.borrow().buffer.text != "unfinished"
+    {
+        return Err("inline edit did not persist independently".into());
+    }
+    snapshot_window(ui.window(), &store.borrow().dir.join("inline-edit.png"))?;
+    ui.invoke_edit(id);
+    {
+        let mut s = store.borrow_mut();
+        let notes = std::mem::take(&mut s.data.notes);
+        let buffer = std::mem::take(&mut s.buffer);
+        sync(ui, pet, &mut s);
+        place(ui, pet);
+        snapshot_window(ui.window(), &s.dir.join("empty-panel.png"))?;
+        s.data.notes = notes;
+        s.buffer = buffer;
+        sync(ui, pet, &mut s);
+        place(ui, pet);
+    }
     press(ui, Key::Escape.into());
     let saved = Store::load(store.borrow().dir.clone())?;
     if saved.data.draft.text != "unfinished" || ui.get_revealed() {
@@ -1167,6 +1571,26 @@ mod tests {
         fs::remove_dir(dir).unwrap();
     }
     #[test]
+    fn inline_edit_preserves_draft_and_rolls_back_failed_save() {
+        let mut s = temporary_store();
+        s.buffer.text = "unfinished new note".into();
+        s.data.notes.push(Note {
+            text: "old".into(),
+            ..Note::default()
+        });
+        s.flush().unwrap();
+        s.update_record(0, |n| n.text = "edited".into()).unwrap();
+        let loaded = Store::load(s.dir.clone()).unwrap();
+        assert_eq!(loaded.data.notes[0].text, "edited");
+        assert_eq!(loaded.data.draft.text, "unfinished new note");
+        assert_eq!(s.buffer.text, "unfinished new note");
+        fs::create_dir(s.dir.join("state.tmp")).unwrap();
+        assert!(s.update_record(0, |n| n.text = "unsaved".into()).is_err());
+        assert_eq!(s.data.notes[0].text, "edited");
+        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
+        cleanup_store(&s.dir);
+    }
+    #[test]
     fn reminder_persistence_legacy_and_completion() {
         let old: Data = serde_json::from_str(r#"{"notes":[{"text":"旧记录","images":[],"done":false}],"draft":{"text":"","images":[],"done":false}}"#).unwrap();
         assert!(old.notes[0].remind_at.is_none());
@@ -1216,6 +1640,33 @@ mod tests {
         assert!(Store::load(s.dir.clone()).unwrap().data.notes[0]
             .remind_at
             .is_none());
+        cleanup_store(&s.dir);
+    }
+    #[test]
+    fn file_only_drop_persists_and_undo_keeps_copy() {
+        let mut s = temporary_store();
+        fs::create_dir(s.dir.join("files")).unwrap();
+        fs::write(s.dir.join("files/测试.txt"), "附件内容").unwrap();
+        s.buffer.text = "未写完的草稿".into();
+        s.capture_note(Note {
+            files: vec![Attachment {
+                name: "测试.txt".into(),
+                path: "测试.txt".into(),
+            }],
+            ..Note::default()
+        })
+        .unwrap();
+        let loaded = Store::load(s.dir.clone()).unwrap();
+        assert_eq!(loaded.data.notes[0].files.len(), 1);
+        assert_eq!(loaded.buffer.text, "未写完的草稿");
+        s.undo_capture().unwrap();
+        assert!(Store::load(s.dir.clone()).unwrap().data.notes.is_empty());
+        assert_eq!(
+            fs::read_to_string(s.dir.join("files/测试.txt")).unwrap(),
+            "附件内容"
+        );
+        fs::remove_file(s.dir.join("files/测试.txt")).unwrap();
+        fs::remove_dir(s.dir.join("files")).unwrap();
         cleanup_store(&s.dir);
     }
     fn temporary_store() -> Store {
@@ -1313,6 +1764,7 @@ mod tests {
                 images: vec!["one.png".into()],
                 done: false,
                 remind_at: None,
+                files: vec![],
             }],
             draft: Note {
                 text: "还没写完".into(),

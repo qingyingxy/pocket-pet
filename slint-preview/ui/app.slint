@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 
-export struct CardData { id:int, body:string, preview:image, has-image:bool, image-count:int, done:bool, due:bool, reminder:string }
+export struct CardData { id:int, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
 
 component Action inherits Rectangle {
     in property<string> label;
@@ -21,6 +21,9 @@ export component PetWindow inherits Window {
     in property<int> count;
     in property<int> due-count;
     in property<bool> happy:false;
+    in property<bool> drop-hover:false;
+    in property<bool> drop-busy:false;
+    Rectangle{x:8px;y:2px;width:150px;height:128px;border-radius:30px;background:root.drop-hover?#30edbc84:transparent;border-width:root.drop-hover?2px:0px;border-color:#dfa066;animate background{duration:100ms;}}
     in property<string> toast;
     in property<bool> can-undo:false;
     in property<bool> toast-error:false;
@@ -41,16 +44,23 @@ export component PetWindow inherits Window {
         }}
         clicked=>{if !root.was-dragged {root.open-record();}}
     }
-    Rectangle {x:root.toast!=""||root.due-count>0?6px:31px;y:137px;width:root.toast!=""||root.due-count>0?154px:104px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
+    Rectangle {x:root.drop-hover||root.drop-busy||root.toast!=""||root.due-count>0?6px:31px;y:137px;width:root.drop-hover||root.drop-busy||root.toast!=""||root.due-count>0?154px:104px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
         animate background {duration:120ms;}
-        Text {text:root.toast!=""?root.toast:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
-        TouchArea {mouse-cursor:pointer;clicked=>{if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
+        Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
+        TouchArea {mouse-cursor:pointer;clicked=>{if root.drop-hover||root.drop-busy {} else if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
     }
 }
 
 export component PocketWindow inherits Window {
     title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
-    out property<float> panel-height:root.task-view ? 570 : (root.has-attachment ? 380 : root.draft != "" ? 300 : 268) + (root.reminder-options ? 46 : 0);
+    out property<float> panel-height: (root.cards.length == 0 ? (root.has-attachment ? 440 : 380) : 570) + (root.reminder-options ? 40 : 0);
+    in-out property<int> expanded-id: -1;
+    in-out property<string> edit-body;
+    callback inline-text(int,string);
+    callback inline-paste(int) -> bool;
+    callback inline-reminder(int,int);
+
+    callback inline-remove(int);
     in property<int> focus-token;
     in property<string> reminder-label;
     in property<string> later-label;
@@ -61,6 +71,9 @@ export component PocketWindow inherits Window {
     in-out property<bool> task-view:false;
     in-out property<string> draft;
     in property<bool> editing:false;
+    in property<bool> drop-busy:false;
+    in property<int> file-count;
+    callback drop-ready(); callback show-files(int);
     in property<bool> has-attachment:false;
     in property<image> attachment;
     in property<int> attachment-count;
@@ -78,20 +91,20 @@ export component PocketWindow inherits Window {
         background:#fffdf9;border-radius:24px;border-width:1px;border-color:#eadfd3;
         drop-shadow-color:#183d2817;drop-shadow-blur:12px;drop-shadow-offset-y:4px;
         VerticalLayout {
-            padding:20px;spacing:12px;
+            padding:18px;spacing:10px;
             HorizontalLayout {height:30px;spacing:8px;
                 Rectangle {width:28px;height:28px;border-radius:9px;background:#f7e6d7;Text{text:"口";color:#b4774c;font-size:16px;horizontal-alignment:center;vertical-alignment:center;}}
                 Text{text:"口袋";font-size:14px;font-weight:600;color:#695447;vertical-alignment:center;}
                 Rectangle {horizontal-stretch:1;}
-                Action {width:68px;height:28px;quiet:true;label:root.task-view?"随手记":"待办 " + root.pending-count;clicked=>{root.change-view(!root.task-view);}}
+                Text {text:"随手记 · 慢慢做";font-size:11px;color:#ad9785;vertical-alignment:center;}
                 Action {width:28px;height:28px;quiet:true;label:"×";clicked=>{root.dismiss();}}
             }
-            if !root.task-view : VerticalLayout {spacing:12px;
-                Rectangle {height:root.has-attachment?190px:root.draft!=""?110px:78px;background:#f7f3ed;border-radius:16px;border-width:1px;border-color:input.has-focus?#dbb89c:#eee5dc;
+            VerticalLayout {spacing:6px;vertical-stretch:0;
+                Rectangle {height:(root.draft!=""?68px:60px) + (root.has-attachment?60px:0px);background:#f7f3ed;border-radius:16px;border-width:1px;border-color:input.has-focus?#dbb89c:#eee5dc;
                     animate border-color {duration:120ms;}
                     if root.draft=="" : Text {x:16px;y:14px;text:"记点什么，或粘贴截图…";color:#baa99a;font-size:15px;}
                     input:=TextInput {
-                        x:16px;y:14px;width:parent.width - 32px;height:root.draft!=""||root.has-attachment?80px:50px;
+                        x:16px;y:14px;width:parent.width - 32px;height:root.draft!=""?40px:32px;
                         text<=>root.draft;single-line:false;wrap:word-wrap;color:#504033;font-size:15px;
                         in property<int> focus-trigger:root.focus-token;
                         init=>{self.focus();}
@@ -109,10 +122,11 @@ export component PocketWindow inherits Window {
                             return reject;
                         }
                     }
-                    if root.has-attachment : Rectangle {x:14px;y:104px;width:parent.width - 28px;height:70px;border-radius:12px;background:#fffdf9;
-                        Image {x:8px;y:8px;width:76px;height:54px;source:root.attachment;image-fit:contain;}
-                        Text {x:94px;y:22px;text:root.attachment-count + " 张图片";font-size:12px;color:#9c8371;}
-                        Action{x:parent.width - 48px;y:17px;width:32px;height:30px;quiet:true;label:"×";clicked=>{root.remove-image();}}
+                    if root.has-attachment : Rectangle {x:14px;y:root.draft!=""?68px:60px;width:parent.width - 28px;height:52px;border-radius:12px;background:#fffdf9;
+                        Image {x:8px;y:8px;width:64px;height:36px;source:root.attachment;image-fit:contain;}
+                        Text {x:root.attachment-count>0?94px:14px;y:17px;width:parent.width - (root.attachment-count>0?230px:150px);overflow:elide;text:root.file-count>0?root.file-count + " 个文件" + (root.attachment-count>0?" · " + root.attachment-count + " 张图片":""):root.attachment-count + " 张图片";font-size:12px;color:#9c8371;}
+                        if root.file-count>0 : Action{x:parent.width - 126px;y:11px;width:72px;height:30px;quiet:true;label:"查看文件";clicked=>{root.show-files(-1);}}
+                        Action{x:parent.width - 48px;y:11px;width:32px;height:30px;quiet:true;label:"×";clicked=>{root.remove-image();}}
                     }
                 }
                 if root.reminder-options : HorizontalLayout {height:34px;spacing:6px;
@@ -120,42 +134,76 @@ export component PocketWindow inherits Window {
                     Action{label:"30 分钟后";height:34px;clicked=>{root.choose-reminder(1);}}
                     Action{label:root.later-label;height:34px;clicked=>{root.choose-reminder(2);}}
                 }
-                HorizontalLayout {height:40px;spacing:8px;
-                    Action{label:root.reminder-label + " ▾";quiet:true;width:208px;clicked=>{root.reminder-options=!root.reminder-options;}}
+                HorizontalLayout {height:28px;spacing:8px;
+                    Action{label:root.reminder-label + " ▾";quiet:true;width:180px;height:28px;clicked=>{root.reminder-options=!root.reminder-options;}}
                     Rectangle{horizontal-stretch:1;}
-                    Action{label:root.editing?"完成编辑":"收下";width:106px;primary:true;clicked=>{root.save();}}
+                    Action{label:"收下 ↵";width:84px;height:28px;primary:true;clicked=>{root.save();}}
                 }
             }
-            if root.task-view : VerticalLayout {spacing:12px;
-                HorizontalLayout {height:38px;
-                    Text{text:"待办事项";color:#3f3129;font-size:24px;font-weight:700;}
+            VerticalLayout {spacing:8px;vertical-stretch:1;
+                HorizontalLayout {height:26px;
+                    Text{text:"待办";color:#695447;font-size:14px;font-weight:700;}
                     Rectangle{horizontal-stretch:1;}
                     Text{text:root.pending-count + " 件待处理";font-size:12px;color:#ad8b73;vertical-alignment:center;}
                 }
-                ScrollView {height:338px;
+                ScrollView {vertical-stretch:1;
                     VerticalLayout {spacing:10px;
-                        for card in root.cards : Rectangle {height:card.due?136px:card.has-image?112px:86px;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:card.due?#ddb68f:#eee4d9;
+                        for card in root.cards : Rectangle {height:root.expanded-id==card.id?(card.has-image||card.file-count>0?282px:226px):card.due?132px:card.has-image?98px:84px;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:card.due?#ddb68f:#eee4d9;
                             Rectangle{x:14px;y:18px;width:22px;height:22px;border-radius:11px;border-width:1px;border-color:card.done?#b7c5a6:#d2bdab;background:card.done?#e5ecdd:#fffdf9;
                                 Text{text:card.done?"✓":"";color:#73935a;horizontal-alignment:center;vertical-alignment:center;}
                                 TouchArea{mouse-cursor:pointer;clicked=>{root.toggle(card.id);}}
                             }
-                            Text{x:48px;y:16px;width:parent.width - (card.has-image?142px:66px);height:44px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
-                            Text{x:48px;y:card.due?64px:parent.height - 26px;text:card.done?"已经完成":card.reminder!=""?card.reminder:"点击补充内容";font-size:11px;color:#b39c88;}
-                            TouchArea{x:44px;y:0;width:parent.width - 44px;height:parent.height;mouse-cursor:pointer;clicked=>{root.edit(card.id);}}
-                            if card.has-image : Image{x:parent.width - 88px;y:14px;width:72px;height:68px;source:card.preview;image-fit:contain;}
-                            if card.due : HorizontalLayout {x:48px;y:96px;width:parent.width - 64px;height:28px;spacing:8px;
+                            if root.expanded-id!=card.id : Text{x:48px;y:14px;width:parent.width - (card.has-image?142px:66px);height:40px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
+                            if root.expanded-id!=card.id : Text{x:48px;y:card.due?64px:parent.height - 22px;text:card.done?"已经完成":card.reminder!=""?card.reminder:"点击补充内容";font-size:11px;color:#b39c88;}
+                            if root.expanded-id!=card.id : TouchArea{x:44px;y:0;width:parent.width - 44px;height:parent.height;mouse-cursor:pointer;clicked=>{root.edit(card.id);}}
+                            if card.has-image && root.expanded-id!=card.id : Image{x:parent.width - 88px;y:14px;width:72px;height:68px;source:card.preview;image-fit:contain;}
+                            if root.expanded-id==card.id : VerticalLayout {
+                                x:48px;y:12px;width:parent.width - 62px;height:parent.height - 24px;spacing:6px;
+                                HorizontalLayout {height:24px;
+                                    Text{text:"编辑这条记录";font-size:11px;color:#a18772;}
+                                    Rectangle{horizontal-stretch:1;}
+                                    Action{label:"收起";height:24px;width:44px;quiet:true;clicked=>{root.edit(card.id);}}
+                                }
+                                Rectangle {height:88px;background:#fffdf9;border-radius:8px;
+                                    TextInput {x:8px;y:8px;width:parent.width - 16px;height:72px;text<=>root.edit-body;wrap:word-wrap;single-line:false;font-size:14px;color:#514033;
+                                        init=>{self.focus();}
+                                        edited=>{root.inline-text(card.id,self.text);}
+                                        key-pressed(event)=>{
+                                            if self.preedit-text!="" {return reject;}
+                                            if event.text==Key.Escape {root.edit(card.id);return accept;}
+                                            if (event.modifiers.control && (event.text=="v" || event.text=="V")) || (event.modifiers.shift && event.text==Key.Insert) {
+                                                if root.inline-paste(card.id) {return accept;}
+                                            }
+                                            return reject;
+                                        }
+                                    }
+                                }
+                                if card.has-image || card.file-count>0 : HorizontalLayout {height:48px;spacing:6px;
+                                    if card.has-image : Image{width:64px;source:card.preview;image-fit:contain;}
+                                    Text{text:card.image-count + " 张图片 · " + card.file-count + " 个文件";font-size:10px;color:#a18772;vertical-alignment:center;}
+                                    if card.file-count>0 : Action{label:"文件";width:40px;height:28px;clicked=>{root.show-files(card.id);}}
+                                    if card.has-image || card.file-count>0 : Action{label:"移除";width:40px;height:28px;clicked=>{root.inline-remove(card.id);}}
+                                }
+                                Text{text:card.reminder!=""?card.reminder:"未设置提醒";font-size:11px;color:#a18772;height:18px;}
+                                HorizontalLayout {height:28px;spacing:4px;
+                                    Action{label:"不提醒";height:28px;clicked=>{root.inline-reminder(card.id,0);}}
+                                    Action{label:"30 分钟后";height:28px;clicked=>{root.inline-reminder(card.id,1);}}
+                                    Action{label:root.later-label;height:28px;clicked=>{root.inline-reminder(card.id,2);}}
+                                }
+                            }
+                            if card.due && root.expanded-id!=card.id : HorizontalLayout {x:48px;y:96px;width:parent.width - 64px;height:28px;spacing:8px;
                                 Action{label:"30 分钟后";height:28px;clicked=>{root.snooze(card.id);}}
                                 Action{label:"知道了";height:28px;quiet:true;clicked=>{root.acknowledge(card.id);}}
                             }
                         }
-                        if root.cards.length==0 : Rectangle{height:180px;Text{text:"口袋空空，心里轻轻。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
+                        if root.cards.length==0 : Rectangle{height:80px;Text{text:"还没有待办，在上面记下第一件事。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
                     }
                 }
                 Action{label:root.show-done?"收起已完成":"查看已完成";height:28px;quiet:true;clicked=>{root.fold();}}
             }
             HorizontalLayout {height:20px;
                 Rectangle {width:5px;height:5px;border-radius:3px;background:root.notice!=""?#dca875:#adc19b;}
-                Text{text:root.notice!=""?root.notice:root.task-view?"只存本机 · 随时收起":"Enter 收下 · Shift+Enter 换行";color:#b39e8c;font-size:11px;vertical-alignment:center;}
+                Text{text:root.notice!=""?root.notice:"Enter 收下 · 点击记录展开";color:#b39e8c;font-size:11px;vertical-alignment:center;}
                 Rectangle{horizontal-stretch:1;}
                 Action{label:"退出";quiet:true;width:36px;height:20px;clicked=>{root.quit();}}
             }
