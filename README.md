@@ -19,6 +19,7 @@ cargo build --release --manifest-path slint-preview/Cargo.toml
 - **Enter**：收下；Shift+Enter 换行。
 - **Ctrl+Alt+V**：全局快捷收下剪贴板；6 秒内点击小猫下方提示可撤销。
 - **点待办数字**：查看、编辑、完成记录。
+- **不提醒 ▾**：可选 30 分钟后或今晚/明早提醒；到点后点小猫徽标查看，可稍后提醒或知晓。
 - **Esc / × / 切换其他窗口**：收起并保留草稿。
 
 两版都使用 Ctrl+Alt+V，体验时请只运行一个实例。
@@ -33,7 +34,7 @@ cargo build --release --manifest-path slint-preview/Cargo.toml
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 功能进度、验证边界与后续路线 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 目录结构、事件和数据流程 |
 
-当前已完成输入气泡简化、快捷收下与撤销；轻提醒、拖放尚未实现。
+当前已完成输入气泡简化、快捷收下与撤销、轻提醒；拖放尚未实现。
 
 ## 验证
 

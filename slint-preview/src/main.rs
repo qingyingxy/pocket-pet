@@ -13,12 +13,15 @@ use std::{
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 slint::include_modules!();
 mod hotkey;
+mod reminders;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 struct Note {
     text: String,
     images: Vec<String>,
     done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remind_at: Option<u64>,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Data {
@@ -111,6 +114,56 @@ impl Store {
         self.undo = None;
         Ok(())
     }
+    fn toggle_note(&mut self, index: usize) -> Result<()> {
+        if index >= self.data.notes.len() {
+            return Err("记录不存在".into());
+        }
+        let before = self.data.clone();
+        let buffer = self.buffer.clone();
+        let note = &mut self.data.notes[index];
+        note.done = !note.done;
+        if note.done {
+            note.remind_at = None;
+        }
+        let done = note.done;
+        let at = note.remind_at;
+        if self.selected == Some(index) {
+            self.buffer.done = done;
+            self.buffer.remind_at = at;
+        }
+        if let Err(error) = self.flush() {
+            self.data = before;
+            self.buffer = buffer;
+            return Err(error);
+        }
+        if self.undo.as_ref().is_some_and(|u| u.index == index) {
+            self.undo = None;
+        }
+        Ok(())
+    }
+    fn set_reminder(&mut self, index: usize, at: Option<u64>) -> Result<()> {
+        if index >= self.data.notes.len() {
+            return Err("记录不存在".into());
+        }
+        if self.data.notes[index].done && at.is_some() {
+            return Err("已完成的记录无需提醒".into());
+        }
+        let before = self.data.clone();
+        let buffer = self.buffer.clone();
+        self.data.notes[index].remind_at = at;
+        if self.selected == Some(index) {
+            self.buffer.remind_at = at;
+        }
+        if let Err(error) = self.flush() {
+            self.data = before;
+            self.buffer = buffer;
+            return Err(error);
+        }
+        if self.undo.as_ref().is_some_and(|u| u.index == index) {
+            self.undo = None;
+        }
+        Ok(())
+    }
     fn thumbnail(&mut self, name: &str) -> Image {
         if let Some(image) = self.cache.get(name) {
             return image.clone();
@@ -151,6 +204,7 @@ impl Store {
                 text: String::new(),
                 images: vec![name],
                 done: false,
+                remind_at: None,
             }));
         }
         Ok(None)
@@ -168,6 +222,7 @@ impl Store {
             text,
             images: vec![],
             done: false,
+            remind_at: None,
         })
     }
 }
@@ -180,6 +235,16 @@ fn save_data(dir: &Path, data: &Data) -> Result<()> {
     Ok(())
 }
 fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
+    let now = reminders::now();
+    ui.set_reminder_label(reminders::label(store.buffer.remind_at, now).into());
+    ui.set_later_label(
+        if chrono::Local::now().time() < chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap() {
+            "今天晚点"
+        } else {
+            "明早 9 点"
+        }
+        .into(),
+    );
     ui.set_draft(store.buffer.text.clone().into());
     ui.set_editing(store.selected.is_some());
     ui.set_has_attachment(!store.buffer.images.is_empty());
@@ -196,6 +261,14 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
     let count = store.data.notes.iter().filter(|n| !n.done).count() as i32;
     ui.set_pending_count(count);
     pet.set_count(count);
+    pet.set_due_count(
+        store
+            .data
+            .notes
+            .iter()
+            .filter(|n| reminders::is_due(n.remind_at, n.done, now))
+            .count() as i32,
+    );
     let mut cards = vec![];
     for i in (0..store.data.notes.len()).rev() {
         let n = store.data.notes[i].clone();
@@ -214,10 +287,26 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
             has_image: !n.images.is_empty(),
             image_count: n.images.len() as i32,
             done: n.done,
+            due: reminders::is_due(n.remind_at, n.done, now),
+            reminder: if n.done || n.remind_at.is_none() {
+                "".into()
+            } else {
+                reminders::label(n.remind_at, now).into()
+            },
         });
     }
-    cards.sort_by_key(|n| n.done);
+    cards.sort_by_key(|n| (n.done, !n.due));
     ui.set_cards(ModelRc::new(VecModel::from(cards)));
+    let next = reminders::next_delay(
+        store
+            .data
+            .notes
+            .iter()
+            .filter(|n| !n.done)
+            .filter_map(|n| n.remind_at),
+        now,
+    );
+    ui.invoke_schedule_reminders(next.map(|d| d.as_secs_f32()).unwrap_or(-1.0));
 }
 fn startup_position(work: RECT, width: i32, height: i32, scale: f32) -> PhysicalPosition {
     let margin = (32.0 * scale).round() as i32;
@@ -282,6 +371,7 @@ fn place(ui: &PocketWindow, pet: &PetWindow) {
 fn reveal(ui: &PocketWindow, pet: &PetWindow) {
     let _ = ui.show();
     place(ui, pet);
+    ui.set_reminder_options(false);
     ui.set_revealed(true);
     if !ui.get_task_view() {
         ui.set_focus_token(ui.get_focus_token() + 1);
@@ -350,6 +440,102 @@ fn run() -> Result<()> {
     let store = Rc::new(RefCell::new(data));
     let ui = PocketWindow::new()?;
     let pet = PetWindow::new()?;
+    sync(&ui, &pet, &mut store.borrow_mut());
+    let reminder_timer = Rc::new(Timer::default());
+    {
+        let timer = reminder_timer.clone();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let state = store.clone();
+        ui.on_schedule_reminders(move |seconds| {
+            if seconds < 0.0 {
+                timer.stop();
+                return;
+            }
+            let weak = weak.clone();
+            let animal = animal.clone();
+            let state = state.clone();
+            timer.start(
+                TimerMode::SingleShot,
+                Duration::from_secs_f32(seconds.max(1.0)),
+                move || {
+                    if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
+                        sync(&ui, &pet, &mut state.borrow_mut());
+                    }
+                },
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let state = store.clone();
+        ui.on_choose_reminder(move |preset| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            if s.buffer.done && preset != 0 {
+                ui.set_notice("已完成的记录无需提醒".into());
+                return;
+            }
+            let at = match preset {
+                0 => None,
+                1 => Some(reminders::now() + reminders::HALF_HOUR),
+                2 => match reminders::later_today(chrono::Local::now()) {
+                    Some(at) => Some(at),
+                    None => {
+                        ui.set_notice("无法计算提醒时间".into());
+                        return;
+                    }
+                },
+                _ => return,
+            };
+            let old = s.buffer.clone();
+            let before = s.data.clone();
+            s.buffer.remind_at = at;
+            if let Err(error) = s.flush() {
+                s.buffer = old;
+                s.data = before;
+                report(&ui, error);
+                return;
+            }
+            ui.set_reminder_options(false);
+            ui.set_notice("提醒设置已保存".into());
+            sync(&ui, &pet, &mut s);
+            place(&ui, &pet);
+        });
+    }
+    for snooze in [false, true] {
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let state = store.clone();
+        let action = move |id: i32| {
+            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+            let at = snooze.then(|| reminders::now() + reminders::HALF_HOUR);
+            if let Err(error) = s.set_reminder(id as usize, at) {
+                report(&ui, error);
+                return;
+            }
+            ui.set_notice(
+                if snooze {
+                    "30 分钟后再提醒"
+                } else {
+                    "已知晓，事项仍保留在待办中"
+                }
+                .into(),
+            );
+            sync(&ui, &pet, &mut s);
+        };
+        if snooze {
+            ui.on_snooze(action);
+        } else {
+            ui.on_acknowledge(action);
+        }
+    }
     sync(&ui, &pet, &mut store.borrow_mut());
     let save_timer = Rc::new(Timer::default());
     let toast_timer = Rc::new(Timer::default());
@@ -527,22 +713,13 @@ fn run() -> Result<()> {
                 if i >= s.data.notes.len() {
                     return;
                 }
-                let old = s.data.notes[i].done;
-                if s.undo.as_ref().is_some_and(|undo| undo.index == i) {
-                    s.undo = None;
+                if let Err(error) = s.toggle_note(i) {
+                    report(&ui, error);
+                    return;
+                }
+                if pet.get_can_undo() && s.undo.is_none() {
                     pet.set_can_undo(false);
                     pet.set_toast("记录已更新".into());
-                }
-                s.data.notes[i].done = !old;
-                if s.selected == Some(i) {
-                    s.buffer.done = !old;
-                }
-                if let Err(e) = s.flush() {
-                    s.data.notes[i].done = old;
-                    if s.selected == Some(i) {
-                        s.buffer.done = old;
-                    }
-                    report(&ui, e);
                 }
                 sync(&ui, &pet, &mut s);
             }
@@ -834,8 +1011,8 @@ fn run() -> Result<()> {
                                     Ok(()) => "PASS: autofocus, Shift+Enter, Enter save, Escape draft persistence".to_string(),
                                     Err(e) => format!("FAIL: {e}"),
                                 });
+                                start_reminder_check(&ui, &pet, state.clone());
                             }
-                            let _ = slint::quit_event_loop();
                         });
                     }
                 });
@@ -897,6 +1074,69 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
     }
     Ok(())
 }
+fn start_reminder_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<Store>>) {
+    let out = state.borrow().dir.clone();
+    {
+        let mut s = state.borrow_mut();
+        for note in &mut s.data.notes {
+            note.remind_at = None;
+        }
+        if let Err(e) = s.set_reminder(0, Some(reminders::now() + 1)) {
+            let _ = fs::write(out.join("reminder-check.txt"), format!("FAIL: {e}"));
+            let _ = slint::quit_event_loop();
+            return;
+        }
+        sync(ui, pet, &mut s);
+    }
+    let weak = ui.as_weak();
+    let animal = pet.as_weak();
+    Timer::single_shot(Duration::from_millis(1500), move || {
+        let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+            return;
+        };
+        if pet.get_due_count() != 1 || ui.get_revealed() {
+            let _ = fs::write(
+                out.join("reminder-check.txt"),
+                "FAIL: timer did not notify quietly",
+            );
+            let _ = slint::quit_event_loop();
+            return;
+        }
+        let _ = snapshot_window(pet.window(), &out.join("reminder-pet.png"));
+        ui.invoke_change_view(true);
+        reveal(&ui, &pet);
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        Timer::single_shot(Duration::from_millis(220), move || {
+            if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
+                let result = (|| -> Result<()> {
+                    snapshot_window(ui.window(), &out.join("reminder-tasks.png"))?;
+                    ui.invoke_snooze(0);
+                    if pet.get_due_count() != 0
+                        || state.borrow().data.notes[0].remind_at.unwrap_or(0) <= reminders::now()
+                    {
+                        return Err("snooze failed".into());
+                    }
+                    ui.invoke_acknowledge(0);
+                    let saved = Store::load(out.clone())?;
+                    if saved.data.notes[0].remind_at.is_some() || saved.data.notes[0].done {
+                        return Err("acknowledge did not preserve unfinished note".into());
+                    }
+                    Ok(())
+                })();
+                let _ = fs::write(
+                    out.join("reminder-check.txt"),
+                    match result {
+                        Ok(()) => "PASS: real timer, quiet badge, snooze, acknowledge persistence"
+                            .to_string(),
+                        Err(e) => format!("FAIL: {e}"),
+                    },
+                );
+            }
+            let _ = slint::quit_event_loop();
+        });
+    });
+}
 fn main() {
     if let Err(e) = run() {
         let msg: Vec<u16> = format!("Slint 预览启动失败：{e}")
@@ -925,6 +1165,58 @@ mod tests {
         }
         fs::remove_dir(dir.join("images")).unwrap();
         fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn reminder_persistence_legacy_and_completion() {
+        let old: Data = serde_json::from_str(r#"{"notes":[{"text":"旧记录","images":[],"done":false}],"draft":{"text":"","images":[],"done":false}}"#).unwrap();
+        assert!(old.notes[0].remind_at.is_none());
+        let mut s = temporary_store();
+        s.data = old;
+        s.set_reminder(0, Some(100)).unwrap();
+        let mut restarted = Store::load(s.dir.clone()).unwrap();
+        assert!(reminders::is_due(
+            restarted.data.notes[0].remind_at,
+            false,
+            200
+        ));
+        restarted
+            .set_reminder(0, Some(200 + reminders::HALF_HOUR))
+            .unwrap();
+        assert!(!reminders::is_due(
+            restarted.data.notes[0].remind_at,
+            false,
+            200
+        ));
+        restarted.toggle_note(0).unwrap();
+        restarted.toggle_note(0).unwrap();
+        let loaded = Store::load(s.dir.clone()).unwrap();
+        assert!(!loaded.data.notes[0].done);
+        assert!(loaded.data.notes[0].remind_at.is_none());
+        cleanup_store(&s.dir);
+    }
+    #[test]
+    fn reminder_failed_save_preserves_selected_buffer() {
+        let mut s = temporary_store();
+        s.data.notes.push(Note {
+            text: "需要提醒".into(),
+            remind_at: Some(100),
+            ..Note::default()
+        });
+        s.selected = Some(0);
+        s.buffer = s.data.notes[0].clone();
+        s.flush().unwrap();
+        fs::create_dir(s.dir.join("state.tmp")).unwrap();
+        assert!(s.set_reminder(0, None).is_err());
+        assert_eq!(s.buffer.remind_at, Some(100));
+        assert_eq!(s.data.notes[0].remind_at, Some(100));
+        assert!(s.toggle_note(0).is_err());
+        assert!(!s.buffer.done);
+        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
+        s.set_reminder(0, None).unwrap();
+        assert!(Store::load(s.dir.clone()).unwrap().data.notes[0]
+            .remind_at
+            .is_none());
+        cleanup_store(&s.dir);
     }
     fn temporary_store() -> Store {
         let suffix = SystemTime::now()
@@ -1020,6 +1312,7 @@ mod tests {
                 text: "稍后回复".into(),
                 images: vec!["one.png".into()],
                 done: false,
+                remind_at: None,
             }],
             draft: Note {
                 text: "还没写完".into(),

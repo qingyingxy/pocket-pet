@@ -3361,6 +3361,7 @@ name = "pocket-pet-slint"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "chrono",
  "image",
  "serde",
  "serde_json",
