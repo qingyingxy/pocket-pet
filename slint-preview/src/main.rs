@@ -19,6 +19,7 @@ mod clipboard;
 mod drop_import;
 mod drop_target;
 mod hotkey;
+mod rail;
 mod reminders;
 mod snap;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -485,6 +486,33 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
         now,
     );
     ui.invoke_schedule_reminders(next.map(|d| d.as_secs_f32()).unwrap_or(-1.0));
+    let rail_notes = store
+        .data
+        .notes
+        .iter()
+        .enumerate()
+        .filter_map(|(id, n)| {
+            let original = store.finishing.get(&id).map(|(n, _, _)| n).unwrap_or(n);
+            (!original.done).then(|| RailCard {
+                id: id as i32,
+                body: if original.text.is_empty() {
+                    "图片 / 文件备忘".into()
+                } else {
+                    original.text.clone().into()
+                },
+                added: added_time::labels(original.created_at, now).0.into(),
+                created: original
+                    .created_at
+                    .map(|t| t.to_string())
+                    .unwrap_or_default()
+                    .into(),
+                completing: store.finishing.contains_key(&id),
+            })
+        })
+        .collect::<Vec<_>>();
+    pet.set_rail_notes(ModelRc::new(VecModel::from(rail_notes)));
+    pet.set_rail_undo(ui.get_completion_undo());
+    pet.invoke_rail_updated();
 }
 fn startup_position(work: RECT, width: i32, height: i32, scale: f32) -> PhysicalPosition {
     let margin = (32.0 * scale).round() as i32;
@@ -556,12 +584,18 @@ fn rgba_image(pixels: &image::RgbaImage) -> Image {
     )
 }
 fn capture_snap(ui: &PocketWindow, rect: [f32; 6], seed: u32) -> Result<SnapVisual> {
-    let started = Instant::now();
-    let scale = ui.window().scale_factor();
     ui.set_capturing(true);
     let frame_result = ui.window().take_snapshot();
     ui.set_capturing(false);
-    let frame = frame_result?;
+    capture_frame(frame_result?, ui.window().scale_factor(), rect, seed)
+}
+fn capture_frame(
+    frame: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
+    scale: f32,
+    rect: [f32; 6],
+    seed: u32,
+) -> Result<SnapVisual> {
+    let started = Instant::now();
     let [x, y, w, h, clip_top, clip_bottom] = rect;
     if !rect.iter().all(|v| v.is_finite()) || w < 1. || h < 1. || scale <= 0. {
         return Err("卡片坐标无效".into());
@@ -822,6 +856,7 @@ fn run() -> Result<()> {
         .with_winit_window_attributes_hook(|attributes| attributes.with_drag_and_drop(false))
         .select()?;
     let snapshot = std::env::args().any(|a| a == "--snapshot");
+    let _test_cursor = snapshot.then(rail::CursorRestore::new);
     let dir = if snapshot {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output")
     } else {
@@ -1779,6 +1814,7 @@ fn run() -> Result<()> {
                     pos.x + (dx * scale) as i32,
                     pos.y + (dy * scale) as i32,
                 ));
+                pet.invoke_rail_place();
             }
         });
     }
@@ -1814,6 +1850,7 @@ fn run() -> Result<()> {
             }
         }
     };
+    let _rail = rail::install(&ui, &pet)?;
     pet.show()?;
     let drop_guard = Rc::new(RefCell::new(None));
     {
@@ -1848,7 +1885,13 @@ fn run() -> Result<()> {
         })?;
     }
     place_at_startup(&pet);
-    reveal(&ui, &pet);
+    pet.invoke_rail_updated();
+    pet.invoke_rail_place();
+    if snapshot {
+        reveal(&ui, &pet);
+    } else {
+        ui.invoke_rail_status();
+    }
     {
         let weak = ui.as_weak();
         let animal = pet.as_weak();
@@ -2311,7 +2354,9 @@ fn start_reminder_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
                     },
                 );
             }
-            let _ = slint::quit_event_loop();
+            if let Some(pet) = animal.upgrade() {
+                pet.invoke_rail_check();
+            }
         });
     });
 }

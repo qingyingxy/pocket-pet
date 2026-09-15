@@ -16,11 +16,88 @@ component Action inherits Rectangle {
     hit:=TouchArea { mouse-cursor:pointer; clicked=>{root.clicked();} }
 }
 
+export struct RailCard {id:int, body:string, added:string, created:string, completing:bool}
+export component RailWindow inherits Window {
+    width:272px;height:314px;no-frame:true;always-on-top:true;background:transparent;
+    default-font-family:"Microsoft YaHei UI";
+    in property<[RailCard]> entries;
+    in-out property<int> current:0;
+    in property<bool> left-side:true;
+    in property<bool> can-undo:false;
+    in property<bool> empty-message:false;
+    in property<bool> preview-visible:false;
+    callback preview-hover(bool);
+    in-out property<bool> menu-open:false;
+    in property<int> busy-id:-1;
+    in property<[DustLayer]> layers;
+    in property<image> backdrop;
+    in property<bool> dust-running:false;
+    private property<float> dust:dust-running?1:0;
+    animate dust{duration:1100ms;easing:linear;}
+    callback step(int);callback detail(int);callback complete(int);callback flip();callback undo();callback shape-changed();
+    changed current=>{root.shape-changed();}
+    changed entries=>{root.shape-changed();}
+    changed can-undo=>{root.shape-changed();}
+    changed empty-message=>{root.shape-changed();}
+    changed menu-open=>{root.shape-changed();}
+    for entry[index] in root.entries : bubble:=Rectangle {
+        x:index==root.current?16px:24px;y:119px + (index - root.current)*82px;
+        width:index==root.current?240px:224px;height:76px;
+        visible:index>=root.current - 1 && index<=root.current + 1;
+        opacity:index==root.current?1:0.48;
+        animate y{duration:180ms;easing:ease-out;}animate x{duration:180ms;}animate opacity{duration:180ms;}
+        private property<bool> hovered:body-hit.has-hover || finish.has-hover || menu-hit.has-hover;
+        Rectangle{width:parent.width;height:parent.height;border-radius:14px;background:#faf8f4;border-width:index==root.current?1px:0px;border-color:#e8dacc;opacity:root.busy-id==entry.id?0:1;
+            Text{x:12px;y:10px;width:parent.width - 50px;height:38px;text:entry.body;wrap:word-wrap;overflow:elide;font-size:13px;color:#514033;}
+            Text{x:12px;y:54px;text:entry.added;font-size:10px;color:#aa9685;}
+            body-hit:=TouchArea{width:parent.width;height:parent.height;mouse-cursor:pointer;
+                scroll-event(event)=>{if root.busy-id<0 && event.delta-y!=0px {root.step(event.delta-y<0px?1:-1);}return accept;}
+                clicked=>{if root.busy-id<0 {if index==root.current {root.detail(entry.id);} else {root.step(index - root.current);}}}
+            }
+            Rectangle{x:206px;y:23px;width:26px;height:26px;visible:index==root.current && bubble.hovered;border-radius:13px;border-width:1px;border-color:#cfb6a0;background:finish.has-hover?#f0dfce:#fffdf9;
+                Image{x:6px;y:6px;width:14px;height:14px;source:@image-url("check.svg");image-fit:contain;}
+                finish:=TouchArea{mouse-cursor:pointer;clicked=>{if root.busy-id<0 && !entry.completing {root.complete(entry.id);}}}
+            }
+            Rectangle{x:180px;y:51px;width:22px;height:20px;visible:index==root.current && bubble.hovered;
+                Text{width:parent.width;height:parent.height;text:"···";color:#9b806b;horizontal-alignment:center;vertical-alignment:center;}
+                menu-hit:=TouchArea{mouse-cursor:pointer;clicked=>{root.menu-open=!root.menu-open;}}
+            }
+        }
+    }
+    if root.busy-id>=0 : Rectangle{x:16px;y:119px;width:240px;height:76px;
+        Image{width:parent.width;height:parent.height;source:root.backdrop;image-fit:fill;opacity:1-root.dust;}
+        for layer in root.layers : Image{
+            private property<float> flight:max(0,min(1,(root.dust - layer.delay)/(1 - layer.delay)));
+            x:layer.drift-x*self.flight*1px;y:layer.drift-y*self.flight*1px;width:240px;height:76px;source:layer.picture;image-fit:fill;opacity:1-self.flight;
+        }
+    }
+    if root.entries.length==0 && root.empty-message : Rectangle{x:16px;y:119px;width:240px;height:76px;border-radius:14px;background:#faf8f4;
+        Text{width:parent.width;height:parent.height;text:"都处理好了";horizontal-alignment:center;vertical-alignment:center;color:#ac9582;font-size:13px;}
+    }
+    if root.can-undo : Rectangle{x:84px;y:284px;width:104px;height:26px;border-radius:13px;background:#fff6e9;
+        Text{width:parent.width;height:parent.height;text:"撤销完成";font-size:11px;color:#947455;horizontal-alignment:center;vertical-alignment:center;}
+        TouchArea{mouse-cursor:pointer;clicked=>{root.undo();}}
+    }
+    if root.menu-open : Rectangle{x:136px;y:201px;width:120px;height:72px;border-radius:12px;background:#fffdf9;border-width:1px;border-color:#e8dacc;
+        VerticalLayout{padding:6px;spacing:2px;
+            Action{label:root.left-side?"移到右侧":"移到左侧";height:28px;quiet:true;clicked=>{root.menu-open=false;root.flip();}}
+            Action{label:"收起菜单";height:28px;quiet:true;clicked=>{root.menu-open=false;}}
+        }
+    }
+}
 export component PetWindow inherits Window {
-    width:166px; height:172px; background:transparent; no-frame:true; always-on-top:true;
+    in property<[RailCard]> rail-notes;
+    in property<bool> rail-undo:false;
+    callback rail-updated();callback rail-place();callback rail-check();
+    callback preview-hover(bool);callback preview-drag(bool);
+    out property<bool> preview-hovered:cat-hit.has-hover || count-hit.has-hover || (root.status-visible && badge-hit.has-hover);
+    in property<bool> native-hover-events:false;
+    changed preview-hovered=>{if !root.native-hover-events {root.preview-hover(root.preview-hovered);}}
+    width:180px; height:172px; background:transparent; no-frame:true; always-on-top:true;
     default-font-family:"Microsoft YaHei UI";
     in property<int> count;
     in property<int> due-count;
+    out property<bool> status-visible:root.drop-hover || root.drop-busy || root.toast!="" || root.nudge-text!="" || root.due-count>0 || root.can-undo;
     in property<bool> happy:false;
     in property<bool> celebrating:false;
     in property<bool> nudging:false;
@@ -37,10 +114,10 @@ export component PetWindow inherits Window {
     private property<length> origin-x; private property<length> origin-y;
     private property<bool> was-dragged:false;
     Image { source:@image-url("cat.svg"); x:root.celebrating?13px:19px; y:root.happy || root.nudging ? 0px : 7px; width:root.celebrating?140px:128px; height:root.celebrating?120px:128px; animate width {duration:240ms;} animate height {duration:240ms;} animate x {duration:240ms;} image-fit:contain; animate y {duration:170ms;easing:ease-out;} }
-    TouchArea { x:12px;y:0px;width:142px;height:133px;mouse-cursor:pointer;
+    cat-hit:=TouchArea { x:12px;y:0px;width:142px;height:133px;mouse-cursor:pointer;
         pointer-event(event)=>{
-            if event.kind == PointerEventKind.down {root.origin-x=self.mouse-x;root.origin-y=self.mouse-y;root.was-dragged=false;}
-            if event.kind == PointerEventKind.up {root.drag-finished();}
+            if event.kind == PointerEventKind.down {root.preview-drag(true);root.origin-x=self.mouse-x;root.origin-y=self.mouse-y;root.was-dragged=false;}
+            if event.kind == PointerEventKind.up {root.preview-drag(false);root.drag-finished();}
         }
         moved=>{if self.pressed {
             if self.mouse-x - root.origin-x>4px || self.mouse-x - root.origin-x < -4px || self.mouse-y - root.origin-y>4px || self.mouse-y - root.origin-y < -4px {
@@ -49,10 +126,14 @@ export component PetWindow inherits Window {
         }}
         clicked=>{if !root.was-dragged {root.open-record();}}
     }
-    Rectangle {x:root.drop-hover||root.drop-busy||root.toast!=""||root.nudge-text!=""||root.due-count>0?6px:31px;y:137px;width:root.drop-hover||root.drop-busy||root.toast!=""||root.nudge-text!=""||root.due-count>0?154px:104px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;
-        animate background {duration:120ms;}
-        Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.nudge-text!=""?root.nudge-text:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"待办  " + root.count;color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
-        TouchArea {mouse-cursor:pointer;clicked=>{if root.drop-hover||root.drop-busy {} else if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
+    Rectangle {x:140px;y:8px;width:root.count>99?36px:root.count>9?30px:24px;height:24px;
+        visible:root.count>0;border-radius:12px;background:#fffaf5;border-width:1px;border-color:#e8dacc;
+        Text {text:root.count>99?"99+":root.count;color:#796354;font-size:12px;font-weight:600;horizontal-alignment:center;vertical-alignment:center;}
+        count-hit:=TouchArea {mouse-cursor:pointer;clicked=>{root.open-record();}}
+    }
+    Rectangle {visible:root.status-visible;x:6px;y:137px;width:154px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;        animate background {duration:120ms;}
+        Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.nudge-text!=""?root.nudge-text:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"已收下";color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
+        badge-hit:=TouchArea {mouse-cursor:pointer;clicked=>{if root.drop-hover||root.drop-busy {} else if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
     }
 }
 
@@ -68,7 +149,9 @@ export component PocketWindow inherits Window {
     in property<bool> fresh-settled:true;
     in property<bool> has-draft-reminder:false;
     callback time-visibility();
-    changed revealed=>{root.time-visibility();}
+    changed revealed=>{root.time-visibility();root.rail-status();}
+    callback rail-status();
+    changed completion-undo=>{root.rail-status();}
     callback notice-updated();
     private property<string> last-notice;
     changed notice=>{if root.notice!="" {root.last-notice=root.notice;} root.notice-updated();}

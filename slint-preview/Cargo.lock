@@ -3362,6 +3362,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "chrono",
+ "i-slint-core",
  "image",
  "raw-window-handle",
  "serde",
