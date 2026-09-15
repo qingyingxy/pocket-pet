@@ -2,6 +2,7 @@
 name = "pocket-pet-slint"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # Internal full-repaint API: keep pinned to the Slint version.

@@ -10,3 +10,14 @@
 *.log
 Thumbs.db
 .DS_Store
+
+# Personal app data and accidental local exports
+**/state.json
+**/state.backup.json
+**/state.tmp
+/PocketPet/
+/PocketPetSlintPreview/
+*.dmp
+*.pfx
+*.p12
+*.key
