@@ -58,7 +58,7 @@ export component PetWindow inherits Window {
 
 export component PocketWindow inherits Window {
     title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
-    out property<float> panel-height: root.zoom-open?570: (root.cards.length == 0 ? (root.has-attachment ? 390 : 330) : 570);
+    out property<float> panel-height:570;
     in-out property<int> expanded-id: -1;
     in-out property<int> editing-id: -1;
     in-out property<int> reminder-id: -1;
@@ -257,7 +257,7 @@ export component PocketWindow inherits Window {
                             }
                             if card.dissolving : TouchArea {}
                         }
-                        if root.cards.length==0 : Rectangle{height:80px;Text{text:"还没有待办，在上面记下第一件事。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
+                        if root.cards.length==0 : Rectangle{height:80px;Text{text:root.done-count>0?"都处理好了，想到什么再记下来。":"还没有待办，在上面记下第一件事。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
                     }
                 }
                 if root.done-count>0 : Action{label:(root.show-done?"收起已完成 · ":"已完成 · ") + root.done-count;height:28px;quiet:true;clicked=>{root.fold();}}

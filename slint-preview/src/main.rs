@@ -2218,6 +2218,25 @@ fn run_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
             if state.borrow().data.notes[id as usize].done {
                 return Err("completion undo failed".into());
             }
+            use slint::Model;
+            // Reproduce the final card leaving the visible model, then reopen.
+            let before = state.borrow().data.clone();
+            let height = ui.get_panel_height();
+            for note in &mut state.borrow_mut().data.notes {
+                note.done = true;
+            }
+            sync(&ui, &pet, &mut state.borrow_mut());
+            let stable = ui.get_panel_height() == height && ui.get_cards().row_count() == 0;
+            snapshot_window(ui.window(), &state.borrow().dir.join("all-done.png"))?;
+            hide(&ui);
+            reveal(&ui, &pet);
+            let reopened_stable = ui.get_panel_height() == height;
+            state.borrow_mut().data = before;
+            sync(&ui, &pet, &mut state.borrow_mut());
+            place(&ui, &pet);
+            if !stable || !reopened_stable {
+                return Err("panel size changed after last completion or reopen".into());
+            }
             nudge(&pet, "3 件待办，空了看看".into());
             snapshot_window(pet.window(), &state.borrow().dir.join("attention-pet.png"))?;
             Ok(())
@@ -2225,7 +2244,7 @@ fn run_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
         let _ = fs::write(
             state.borrow().dir.join("completion-check.txt"),
             match result {
-                Ok(()) => "PASS: real pixel layers, timed collapse, image buffer release, undo and attention rendering".into(),
+                Ok(()) => "PASS: real pixel layers, timed collapse, image buffer release, undo, stable empty panel, stable reopen and attention rendering".into(),
                 Err(e) => format!("FAIL: {e}"),
             },
         );
