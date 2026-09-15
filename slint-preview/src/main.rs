@@ -22,6 +22,7 @@ mod hotkey;
 mod rail;
 mod reminders;
 mod snap;
+mod tray;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Attachment {
@@ -848,21 +849,69 @@ async fn create_drop_target(
         },
     )
 }
+// Recover an off-screen pet without relocating it on every tray click.
+fn restore_pet_position(pet: &PetWindow) {
+    let p = pet.window().position();
+    let size = pet.window().size();
+    unsafe {
+        let mut monitor: MONITORINFO = std::mem::zeroed();
+        monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(
+            MonitorFromPoint(POINT { x: p.x, y: p.y }, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        ) != 0
+        {
+            let r = monitor.rcWork;
+            pet.window().set_position(PhysicalPosition::new(
+                p.x.clamp(r.left, (r.right - size.width as i32).max(r.left)),
+                p.y.clamp(r.top, (r.bottom - size.height as i32).max(r.top)),
+            ));
+        }
+    }
+    pet.invoke_rail_place();
+}
 fn run() -> Result<()> {
     use winit::platform::windows::WindowAttributesExtWindows;
-    slint::BackendSelector::new()
-        .backend_name("winit".into())
-        .renderer_name("software".into())
-        .with_winit_window_attributes_hook(|attributes| attributes.with_drag_and_drop(false))
-        .select()?;
     let snapshot = std::env::args().any(|a| a == "--snapshot");
-    let _test_cursor = snapshot.then(rail::CursorRestore::new);
+    let _instance = if snapshot {
+        None
+    } else {
+        match tray::Instance::acquire()? {
+            Some(guard) => Some(guard),
+            None => return Ok(()),
+        }
+    };
     let dir = if snapshot {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output")
     } else {
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA 不可用")?)
             .join("PocketPetSlintPreview")
     };
+    let preferences = if snapshot {
+        tray::Preferences::default()
+    } else {
+        tray::Preferences::load(&dir)?
+    };
+    let tray_check = std::env::args().any(|a| a == "--tray-check");
+    let tray = if snapshot && !tray_check {
+        None
+    } else {
+        Some(tray::Tray::new(preferences.topmost)?)
+    };
+    let owner = tray.as_ref().map(|t| t.control().owner());
+    slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name("software".into())
+        .with_winit_window_attributes_hook(move |attributes| {
+            let attributes = attributes.with_drag_and_drop(false).with_skip_taskbar(true);
+            if let Some(owner) = owner {
+                attributes.with_owner_window(owner)
+            } else {
+                attributes
+            }
+        })
+        .select()?;
+    let _test_cursor = snapshot.then(rail::CursorRestore::new);
     let mut data = Store::load(dir)?;
     if snapshot {
         data.data = Data::default();
@@ -885,6 +934,8 @@ fn run() -> Result<()> {
     let store = Rc::new(RefCell::new(data));
     let ui = PocketWindow::new()?;
     let pet = PetWindow::new()?;
+    pet.set_topmost(preferences.topmost);
+    ui.set_topmost(preferences.topmost);
     let notice_timer = Rc::new(Timer::default());
     {
         let timer = notice_timer.clone();
@@ -1147,7 +1198,8 @@ fn run() -> Result<()> {
             let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
                 return;
             };
-            let busy = pet.get_drop_busy()
+            let busy = pet.get_desktop_hidden()
+                || pet.get_drop_busy()
                 || pet.get_drop_hover()
                 || !pet.get_toast().is_empty()
                 || pet.get_due_count() > 0
@@ -1751,6 +1803,7 @@ fn run() -> Result<()> {
     {
         let state = store.clone();
         let weak = ui.as_weak();
+        let animal = pet.as_weak();
         ui.on_quit(move || {
             if weak.upgrade().is_some_and(|ui| ui.get_drop_busy()) {
                 if let Some(ui) = weak.upgrade() {
@@ -1760,6 +1813,11 @@ fn run() -> Result<()> {
             }
             if let Err(e) = state.borrow_mut().flush() {
                 if let Some(ui) = weak.upgrade() {
+                    if let Some(pet) = animal.upgrade() {
+                        pet.set_desktop_hidden(false);
+                        let _ = pet.show();
+                        reveal(&ui, &pet);
+                    }
                     report(&ui, e);
                 }
                 return;
@@ -1850,7 +1908,112 @@ fn run() -> Result<()> {
             }
         }
     };
-    let _rail = rail::install(&ui, &pet)?;
+    let rail_window = rail::install(&ui, &pet)?;
+    rail_window.set_topmost(preferences.topmost);
+    if let Some(tray) = tray.as_ref() {
+        let control = tray.control();
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let view = rail_window.as_weak();
+        let state = store.clone();
+        // The native tray thread never touches Slint components or the Store.
+        let dispatcher = Rc::new(move |action: tray::Action| {
+            let (Some(ui), Some(pet), Some(rail)) =
+                (weak.upgrade(), animal.upgrade(), view.upgrade())
+            else {
+                return;
+            };
+            match action {
+                tray::Action::Show | tray::Action::Record => {
+                    pet.set_desktop_hidden(false);
+                    let _ = pet.show();
+                    restore_pet_position(&pet);
+                    pet.window().with_winit_window(|w| w.focus_window());
+                    if matches!(action, tray::Action::Record) {
+                        ui.set_task_view(false);
+                        reveal(&ui, &pet);
+                    }
+                }
+                tray::Action::ToggleVisibility => {
+                    if pet.get_desktop_hidden() {
+                        pet.set_desktop_hidden(false);
+                        let _ = pet.show();
+                        restore_pet_position(&pet);
+                        pet.window().with_winit_window(|w| w.focus_window());
+                    } else {
+                        if ui.get_drop_busy() {
+                            reveal(&ui, &pet);
+                            ui.set_notice("正在收下文件，请稍等再隐藏".into());
+                            return;
+                        }
+                        if let Err(error) = state.borrow_mut().flush() {
+                            reveal(&ui, &pet);
+                            report(&ui, error);
+                            return;
+                        }
+                        pet.set_desktop_hidden(true);
+                        pet.invoke_preview_hover(false);
+                        hide(&ui);
+                        ui.invoke_rail_status();
+                        let _ = rail.hide();
+                        let _ = pet.hide();
+                    }
+                }
+                tray::Action::ToggleTopmost => {
+                    let preferences = tray::Preferences {
+                        topmost: !pet.get_topmost(),
+                    };
+                    if let Err(error) = preferences.save(&state.borrow().dir) {
+                        pet.set_desktop_hidden(false);
+                        let _ = pet.show();
+                        reveal(&ui, &pet);
+                        report(&ui, error);
+                    } else {
+                        pet.set_topmost(preferences.topmost);
+                        ui.set_topmost(preferences.topmost);
+                        rail.set_topmost(preferences.topmost);
+                    }
+                }
+                tray::Action::Exit => {
+                    // Reuse the existing import guard and durable-save path.
+                    if ui.get_drop_busy() {
+                        pet.set_desktop_hidden(false);
+                        let _ = pet.show();
+                        reveal(&ui, &pet);
+                    }
+                    ui.invoke_quit();
+                }
+            }
+            control.state(!pet.get_desktop_hidden(), pet.get_topmost());
+        });
+        // A Slint callback marshals Send-only native actions to this UI-thread closure.
+        let weak = ui.as_weak();
+        ui.on_tray_action(move |code| {
+            let action = match code {
+                0 => tray::Action::Show,
+                1 => tray::Action::ToggleVisibility,
+                2 => tray::Action::Record,
+                3 => tray::Action::ToggleTopmost,
+                _ => tray::Action::Exit,
+            };
+            dispatcher(action);
+        });
+        tray.on_action(move |action| {
+            let code = match action {
+                tray::Action::Show => 0,
+                tray::Action::ToggleVisibility => 1,
+                tray::Action::Record => 2,
+                tray::Action::ToggleTopmost => 3,
+                tray::Action::Exit => 4,
+            };
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_tray_action(code);
+                }
+            });
+        });
+    }
     pet.show()?;
     let drop_guard = Rc::new(RefCell::new(None));
     {
@@ -1959,6 +2122,11 @@ fn run() -> Result<()> {
             place(&ui, &pet);
         }
     });
+    if snapshot && tray_check {
+        start_tray_check(&ui, &pet, &rail_window, store.borrow().dir.clone());
+        slint::run_event_loop_until_quit()?;
+        return Ok(());
+    }
     if snapshot {
         let weak = ui.as_weak();
         let animal = pet.as_weak();
@@ -2026,7 +2194,11 @@ fn run() -> Result<()> {
             }
         });
     }
-    slint::run_event_loop()?;
+    if snapshot {
+        slint::run_event_loop()?;
+    } else {
+        slint::run_event_loop_until_quit()?;
+    }
     Ok(())
 }
 fn snapshot_window(window: &slint::Window, path: &Path) -> Result<()> {
@@ -2359,6 +2531,124 @@ fn start_reminder_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
             }
         });
     });
+}
+fn start_tray_check(ui: &PocketWindow, pet: &PetWindow, rail: &RailWindow, out: PathBuf) {
+    let results = Rc::new(RefCell::new(Vec::<String>::new()));
+    for (ms, stage) in [
+        (500, 0),
+        (750, 1),
+        (1050, 2),
+        (1350, 3),
+        (1650, 4),
+        (2000, 5),
+        (2400, 6),
+    ] {
+        let weak = ui.as_weak();
+        let animal = pet.as_weak();
+        let view = rail.as_weak();
+        let results = results.clone();
+        let out = out.clone();
+        Timer::single_shot(Duration::from_millis(ms), move || {
+            let (Some(ui), Some(pet), Some(rail)) =
+                (weak.upgrade(), animal.upgrade(), view.upgrade())
+            else {
+                return;
+            };
+            let native = |window: &slint::Window, topmost: bool| -> bool {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                window
+                    .with_winit_window(|w| {
+                        let Ok(handle) = w.window_handle() else {
+                            return false;
+                        };
+                        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+                            return false;
+                        };
+                        unsafe {
+                            let hwnd = h.hwnd.get() as HWND;
+                            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                            ex & WS_EX_APPWINDOW as isize == 0
+                                && !GetWindow(hwnd, GW_OWNER).is_null()
+                                && (ex & WS_EX_TOPMOST as isize != 0) == topmost
+                        }
+                    })
+                    .unwrap_or(false)
+            };
+            match stage {
+                0 => {
+                    let _ = rail.show();
+                    ui.invoke_tray_action(3);
+                }
+                1 => {
+                    let ok = !pet.get_topmost()
+                        && !ui.get_topmost()
+                        && !rail.get_topmost()
+                        && native(pet.window(), false)
+                        && native(ui.window(), false)
+                        && native(rail.window(), false)
+                        && tray::Preferences::load(&out).is_ok_and(|p| !p.topmost);
+                    results
+                        .borrow_mut()
+                        .push(format!("topmost-off-and-persisted={ok}"));
+                    ui.invoke_tray_action(3);
+                }
+                2 => {
+                    let ok = pet.get_topmost()
+                        && ui.get_topmost()
+                        && rail.get_topmost()
+                        && native(pet.window(), true)
+                        && native(ui.window(), true)
+                        && native(rail.window(), true);
+                    results
+                        .borrow_mut()
+                        .push(format!("topmost-on-all-windows={ok}"));
+                    ui.invoke_tray_action(1);
+                }
+                3 => {
+                    let ok = pet.get_desktop_hidden()
+                        && !ui.get_revealed()
+                        && pet
+                            .window()
+                            .with_winit_window(|w| w.is_visible() == Some(false))
+                            .unwrap_or(false)
+                        && rail
+                            .window()
+                            .with_winit_window(|w| w.is_visible() == Some(false))
+                            .unwrap_or(false);
+                    results.borrow_mut().push(format!("hide-closes-all={ok}"));
+                    ui.invoke_tray_action(0);
+                }
+                4 => {
+                    let ok = !pet.get_desktop_hidden()
+                        && !ui.get_revealed()
+                        && pet
+                            .window()
+                            .with_winit_window(|w| w.is_visible() == Some(true))
+                            .unwrap_or(false);
+                    results.borrow_mut().push(format!("restore-pet-only={ok}"));
+                    ui.invoke_tray_action(2);
+                }
+                5 => {
+                    results.borrow_mut().push(format!(
+                        "record-opens-panel={}",
+                        ui.get_revealed() && !pet.get_desktop_hidden()
+                    ));
+                }
+                _ => {
+                    let all = results.borrow().iter().all(|r| r.ends_with("=true"));
+                    let _ = fs::write(
+                        out.join("tray-check.txt"),
+                        format!(
+                            "{}\n{}\n",
+                            if all { "PASS" } else { "FAIL" },
+                            results.borrow().join("\n")
+                        ),
+                    );
+                    ui.invoke_quit();
+                }
+            }
+        });
+    }
 }
 fn main() {
     if let Err(e) = run() {

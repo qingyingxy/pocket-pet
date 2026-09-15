@@ -18,7 +18,9 @@ component Action inherits Rectangle {
 
 export struct RailCard {id:int, body:string, added:string, created:string, completing:bool}
 export component RailWindow inherits Window {
-    width:272px;height:314px;no-frame:true;always-on-top:true;background:transparent;
+    title:"口袋 · 速览";
+    in property<bool> topmost:true;
+    width:272px;height:314px;no-frame:true;always-on-top:root.topmost;background:transparent;
     default-font-family:"Microsoft YaHei UI";
     in property<[RailCard]> entries;
     in-out property<int> current:0;
@@ -86,14 +88,17 @@ export component RailWindow inherits Window {
     }
 }
 export component PetWindow inherits Window {
+    title:"口袋宠物";
+    in property<bool> topmost:true;
     in property<[RailCard]> rail-notes;
     in property<bool> rail-undo:false;
     callback rail-updated();callback rail-place();callback rail-check();
     callback preview-hover(bool);callback preview-drag(bool);
     out property<bool> preview-hovered:cat-hit.has-hover || count-hit.has-hover || (root.status-visible && badge-hit.has-hover);
     in property<bool> native-hover-events:false;
+    in property<bool> desktop-hidden:false;
     changed preview-hovered=>{if !root.native-hover-events {root.preview-hover(root.preview-hovered);}}
-    width:180px; height:172px; background:transparent; no-frame:true; always-on-top:true;
+    width:180px; height:172px; background:transparent; no-frame:true; always-on-top:root.topmost;
     default-font-family:"Microsoft YaHei UI";
     in property<int> count;
     in property<int> due-count;
@@ -138,6 +143,8 @@ export component PetWindow inherits Window {
 }
 
 export component PocketWindow inherits Window {
+    callback tray-action(int);
+    in property<bool> topmost:true;
     title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
     out property<float> panel-height:570;
     in-out property<int> expanded-id: -1;
@@ -179,7 +186,7 @@ export component PocketWindow inherits Window {
     in property<string> later-label;
     in-out property<bool> reminder-options:false;
     callback choose-reminder(int); callback snooze(int); callback acknowledge(int); callback schedule-reminders(float);
-    background:transparent;no-frame:true;always-on-top:true;default-font-family:"Microsoft YaHei UI";
+    background:transparent;no-frame:true;always-on-top:root.topmost;default-font-family:"Microsoft YaHei UI";
     in property<bool> revealed:false;
     in-out property<bool> task-view:false;
     in-out property<string> draft;

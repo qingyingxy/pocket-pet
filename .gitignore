@@ -21,3 +21,6 @@ Thumbs.db
 *.pfx
 *.p12
 *.key
+
+**/preferences.json
+**/preferences.tmp

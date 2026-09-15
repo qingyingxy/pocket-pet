@@ -36,7 +36,7 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 .\slint-preview\target\release\pocket-pet-slint.exe
 ```
 
-启动后只显示小猫。也可双击已构建的 exe。请只运行一个实例，避免全局快捷键冲突；目前没有单实例保护。
+启动后显示小猫和系统托盘图标，不占任务栏；也可双击已构建的 exe。再次启动会唤回已有实例，不重复注册快捷键。托盘图标可能收在时钟旁的 ^ 中。
 
 | 操作 | 结果 |
 | --- | --- |
@@ -49,7 +49,7 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 | 拖入文字、图片或本地文件 | 保存一条记录和附件副本 |
 | Esc、关闭或切换其他窗口 | 收起面板并保留草稿 |
 
-退出入口在完整面板右上角“…”菜单。更多操作见 [Slint 版说明](slint-preview/README.md)。
+托盘左键找回小猫，右键可显示/隐藏、记一条、切换置顶、设置开机启动或退出。置顶默认开启并记忆选择，统一作用于三个窗口；开机启动默认关闭。隐藏期间暂停桌面提示，恢复后可查看到期事项。退出也可使用完整面板右上角菜单。更多操作见 [Slint 版说明](slint-preview/README.md)。
 
 ## 数据在哪里
 

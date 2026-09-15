@@ -680,7 +680,13 @@ impl Preview {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        if ui.get_revealed() || self.dragging.get() {
+        if ui.get_revealed()
+            || self.dragging.get()
+            || self
+                .pet
+                .upgrade()
+                .is_some_and(|pet| pet.get_desktop_hidden())
+        {
             self.hide();
             return;
         }
