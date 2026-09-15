@@ -1,7 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 
 export struct DustLayer { picture:image, delay:float, drift-x:float, drift-y:float, swirl:float }
-export struct CardData { id:int, snap-ready:bool, snap-running:bool, snap-layers:[DustLayer], snap-backdrop:image, snap-x:float, snap-y:float, snap-width:float, snap-height:float, frozen-height:float, dissolving:bool, collapsing:bool, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
+export struct CardData { id:int, added-relative:string, added-exact:string, multiline:bool, snap-ready:bool, snap-running:bool, snap-layers:[DustLayer], snap-backdrop:image, snap-x:float, snap-y:float, snap-width:float, snap-height:float, frozen-height:float, dissolving:bool, collapsing:bool, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
 
 component Action inherits Rectangle {
     in property<string> label;
@@ -58,8 +58,27 @@ export component PetWindow inherits Window {
 
 export component PocketWindow inherits Window {
     title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
-    out property<float> panel-height: (root.cards.length == 0 ? (root.has-attachment ? 440 : 380) : 570) + (root.reminder-options ? 40 : 0);
+    out property<float> panel-height: root.zoom-open?570: (root.cards.length == 0 ? (root.has-attachment ? 390 : 330) : 570);
     in-out property<int> expanded-id: -1;
+    in-out property<int> editing-id: -1;
+    in-out property<int> reminder-id: -1;
+    in-out property<bool> menu-open:false;
+    in property<int> done-count;
+    in property<int> fresh-id:-1;
+    in property<bool> fresh-settled:true;
+    in property<bool> has-draft-reminder:false;
+    callback time-visibility();
+    changed revealed=>{root.time-visibility();}
+    callback notice-updated();
+    private property<string> last-notice;
+    changed notice=>{if root.notice!="" {root.last-notice=root.notice;} root.notice-updated();}
+    callback preview-image(int,int);
+    callback close-image();
+    in property<bool> zoom-open:false;
+    in property<image> zoom-image;
+    in property<int> zoom-note:-1;
+    in property<int> zoom-index;
+    in property<int> zoom-count;
     in-out property<string> edit-body;
     callback inline-text(int,string);
     callback inline-paste(int) -> bool;
@@ -107,15 +126,15 @@ export component PocketWindow inherits Window {
                 Rectangle {width:28px;height:28px;border-radius:9px;background:#f7e6d7;Text{text:"口";color:#b4774c;font-size:16px;horizontal-alignment:center;vertical-alignment:center;}}
                 Text{text:"口袋";font-size:14px;font-weight:600;color:#695447;vertical-alignment:center;}
                 Rectangle {horizontal-stretch:1;}
-                Text {text:"随手记 · 慢慢做";font-size:11px;color:#ad9785;vertical-alignment:center;}
+                Action {width:28px;height:28px;quiet:true;label:"...";clicked=>{root.menu-open=!root.menu-open;}}
                 Action {width:28px;height:28px;quiet:true;label:"×";clicked=>{root.dismiss();}}
             }
             VerticalLayout {spacing:6px;vertical-stretch:0;
-                Rectangle {height:(root.draft!=""?68px:60px) + (root.has-attachment?60px:0px);background:#f7f3ed;border-radius:16px;border-width:1px;border-color:input.has-focus?#dbb89c:#eee5dc;
+                Rectangle {height:(root.draft!=""?68px:56px) + (root.has-attachment?60px:0px);background:#f7f3ed;border-radius:16px;border-width:1px;border-color:input.has-focus?#dbb89c:#eee5dc;
                     animate border-color {duration:120ms;}
-                    if root.draft=="" : Text {x:16px;y:14px;text:"记点什么，或粘贴截图…";color:#baa99a;font-size:15px;}
+                    if root.draft=="" : Text {x:14px;y:15px;text:"记点什么…";color:#baa99a;font-size:15px;}
                     input:=TextInput {
-                        x:16px;y:14px;width:parent.width - 32px;height:root.draft!=""?40px:32px;
+                        x:14px;y:12px;width:parent.width - 108px;height:root.draft!=""?40px:30px;
                         text<=>root.draft;single-line:false;wrap:word-wrap;color:#504033;font-size:15px;
                         in property<int> focus-trigger:root.focus-token;
                         init=>{self.focus();}
@@ -133,22 +152,17 @@ export component PocketWindow inherits Window {
                             return reject;
                         }
                     }
-                    if root.has-attachment : Rectangle {x:14px;y:root.draft!=""?68px:60px;width:parent.width - 28px;height:52px;border-radius:12px;background:#fffdf9;
-                        Image {x:8px;y:8px;width:64px;height:36px;source:root.attachment;image-fit:contain;}
+                    Action{x:parent.width - 88px;y:root.draft!=""?30px:14px;width:76px;height:28px;primary:true;label:"收下";clicked=>{root.save();}}
+                    if root.has-attachment : Rectangle {x:14px;y:root.draft!=""?68px:56px;width:parent.width - 28px;height:52px;border-radius:12px;background:#fffdf9;
+                        Image {x:8px;y:8px;width:64px;height:36px;source:root.attachment;image-fit:contain; TouchArea{mouse-cursor:pointer;clicked=>{root.preview-image(-1,0);}}}
                         Text {x:root.attachment-count>0?94px:14px;y:17px;width:parent.width - (root.attachment-count>0?230px:150px);overflow:elide;text:root.file-count>0?root.file-count + " 个文件" + (root.attachment-count>0?" · " + root.attachment-count + " 张图片":""):root.attachment-count + " 张图片";font-size:12px;color:#9c8371;}
                         if root.file-count>0 : Action{x:parent.width - 126px;y:11px;width:72px;height:30px;quiet:true;label:"查看文件";clicked=>{root.show-files(-1);}}
                         Action{x:parent.width - 48px;y:11px;width:32px;height:30px;quiet:true;label:"×";clicked=>{root.remove-image();}}
                     }
                 }
-                if root.reminder-options : HorizontalLayout {height:34px;spacing:6px;
-                    Action{label:"不提醒";height:34px;clicked=>{root.choose-reminder(0);}}
-                    Action{label:"30 分钟后";height:34px;clicked=>{root.choose-reminder(1);}}
-                    Action{label:root.later-label;height:34px;clicked=>{root.choose-reminder(2);}}
-                }
-                HorizontalLayout {height:28px;spacing:8px;
-                    Action{label:root.reminder-label + " ▾";quiet:true;width:180px;height:28px;clicked=>{root.reminder-options=!root.reminder-options;}}
-                    Rectangle{horizontal-stretch:1;}
-                    Action{label:"收下 ↵";width:84px;height:28px;primary:true;clicked=>{root.save();}}
+                if root.has-draft-reminder : HorizontalLayout {height:24px;
+                    Text{text:root.reminder-label;font-size:11px;color:#a18772;vertical-alignment:center;}
+                    Action{label:"取消提醒";quiet:true;width:68px;height:24px;clicked=>{root.choose-reminder(0);}}
                 }
             }
             VerticalLayout {spacing:8px;vertical-stretch:1;
@@ -160,7 +174,9 @@ export component PocketWindow inherits Window {
                 task-scroll:=ScrollView {vertical-stretch:1;vertical-scrollbar-policy:root.capturing?ScrollBarPolicy.always-off:ScrollBarPolicy.as-needed;horizontal-scrollbar-policy:root.capturing?ScrollBarPolicy.always-off:ScrollBarPolicy.as-needed;
                     VerticalLayout {spacing:10px;
                         for card in root.cards : card-shell:=Rectangle {
-                            private property<length> base-height:card.dissolving && card.frozen-height>0 ? card.frozen-height*1px : root.expanded-id==card.id?(card.has-image||card.file-count>0?282px:226px):card.due?132px:card.has-image?98px:84px;
+                            private property<length> base-height:card.dissolving && card.frozen-height>0 ? card.frozen-height*1px : root.expanded-id==card.id?(210px+(card.has-image||card.file-count>0?54px:0px)+(root.reminder-id==card.id?34px:0px)):card.due?128px:card.has-image?112px:card.reminder!=""||card.file-count>0?80px:card.multiline?80px:72px;
+                            private property<float> arrival:root.fresh-id==card.id && !root.fresh-settled?0:1;
+                            opacity:root.expanded-id==card.id?1:self.arrival;animate arrival{duration:180ms;easing:ease-out;}
                             private property<float> dust:card.snap-running?1:0;
                             in property<int> requested:root.completion-request;
                             function begin() {
@@ -172,24 +188,28 @@ export component PocketWindow inherits Window {
                             animate height {duration:200ms;easing:ease-in-out;}
                             clip:false;
                             Rectangle {x:0px;y:0px;width:parent.width;height:parent.height;clip:true;opacity:card.snap-ready?0:1;
-                              Rectangle {x:0px;y:0px;width:card-shell.width;height:card-shell.base-height;border-radius:16px;background:#f8f4ee;border-width:1px;border-color:card.due?#ddb68f:#eee4d9;
+                              Rectangle {x:0px;y:0px;width:card-shell.width;height:card-shell.base-height;border-radius:16px;background:root.fresh-id==card.id?#f5e5ce:card.due?#faf2e7:card-hover.has-hover?#f4eee5:#faf8f4;border-width:card.due?1px:0px;border-color:#e8d1b5;animate background{duration:300ms;}
+                            card-hover:=TouchArea {}
                             Rectangle{x:14px;y:18px;width:22px;height:22px;border-radius:11px;border-width:1px;border-color:card.done||card.dissolving?#b7c5a6:#d2bdab;background:card.done||card.dissolving?#e5ecdd:#fffdf9;
                                 if card.done || card.dissolving : Image{x:4px;y:4px;width:14px;height:14px;source:@image-url("check.svg");image-fit:contain;}
                                 TouchArea{enabled:!card.dissolving;mouse-cursor:pointer;clicked=>{card-shell.begin();}}
                             }
-                            if root.expanded-id!=card.id : Text{x:48px;y:14px;width:parent.width - (card.has-image?142px:66px);height:40px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
-                            if root.expanded-id!=card.id : Text{x:48px;y:card.due?64px:parent.height - 22px;text:card.done?"已经完成":card.reminder!=""?card.reminder:"点击补充内容";font-size:11px;color:#b39c88;}
+                            if root.expanded-id!=card.id : Text{x:48px;y:card.multiline||card.has-image||card.reminder!=""||card.file-count>0?14px:17px;width:parent.width - (card.has-image?142px:66px);height:40px;text:card.body==""?"图片备忘":card.body;font-size:14px;color:card.done?#a9998a:#514033;wrap:word-wrap;overflow:elide;}
+                            if root.expanded-id!=card.id && (card.reminder!="" || card.file-count>0) : Text{x:48px;y:card.due?64px:parent.height - 22px;width:parent.width - 166px;overflow:elide;text:card.reminder!=""?"提醒："+card.reminder:card.file-count + " 个文件";font-size:11px;color:#aa907b;}
+                            if root.expanded-id!=card.id : Text{x:parent.width - 120px;y:card.due?64px:parent.height - 22px;width:104px;height:16px;text:card.added-relative;font-size:10px;color:#aa9685;horizontal-alignment:right;}
                             if root.expanded-id!=card.id : TouchArea{x:44px;y:0;width:parent.width - 44px;height:parent.height;mouse-cursor:pointer;clicked=>{root.edit(card.id);}}
-                            if card.has-image && root.expanded-id!=card.id : Image{x:parent.width - 88px;y:14px;width:72px;height:68px;source:card.preview;image-fit:contain;}
+                            if card.has-image && root.expanded-id!=card.id : Image{x:parent.width - 88px;y:14px;width:72px;height:68px;source:card.preview;image-fit:contain;TouchArea{mouse-cursor:pointer;clicked=>{root.preview-image(card.id,0);}}}
                             if root.expanded-id==card.id : VerticalLayout {
                                 x:48px;y:12px;width:parent.width - 62px;height:parent.height - 24px;spacing:6px;
                                 HorizontalLayout {height:24px;
-                                    Text{text:"编辑这条记录";font-size:11px;color:#a18772;}
+                                    Text{text:root.editing-id==card.id?"编辑内容":"记录内容";font-size:11px;color:#a18772;}
                                     Rectangle{horizontal-stretch:1;}
+                                    if root.editing-id!=card.id : Action{label:"编辑";height:24px;width:44px;quiet:true;clicked=>{root.editing-id=card.id;}}
                                     Action{label:"收起";height:24px;width:44px;quiet:true;clicked=>{root.edit(card.id);}}
                                 }
+                                Text{height:16px;text:card.added-exact;font-size:10px;color:#aa9685;}
                                 Rectangle {height:88px;background:#fffdf9;border-radius:8px;
-                                    TextInput {x:8px;y:8px;width:parent.width - 16px;height:72px;text<=>root.edit-body;wrap:word-wrap;single-line:false;font-size:14px;color:#514033;
+                                    if root.editing-id==card.id : TextInput {x:8px;y:8px;width:parent.width - 16px;height:72px;text<=>root.edit-body;wrap:word-wrap;single-line:false;font-size:14px;color:#514033;
                                         init=>{self.focus();}
                                         edited=>{root.inline-text(card.id,self.text);}
                                         key-pressed(event)=>{
@@ -201,15 +221,20 @@ export component PocketWindow inherits Window {
                                             return reject;
                                         }
                                     }
+                                    if root.editing-id!=card.id : ScrollView{x:8px;y:8px;width:parent.width - 16px;height:72px;
+                                        Text {text:root.edit-body==""?"添加一句说明…":root.edit-body;wrap:word-wrap;color:#514033;font-size:14px;
+                                            TouchArea{mouse-cursor:text;clicked=>{root.editing-id=card.id;}}
+                                        }
+                                    }
                                 }
                                 if card.has-image || card.file-count>0 : HorizontalLayout {height:48px;spacing:6px;
-                                    if card.has-image : Image{width:64px;source:card.preview;image-fit:contain;}
+                                    if card.has-image : Image{width:64px;source:card.preview;image-fit:contain;TouchArea{mouse-cursor:pointer;clicked=>{root.preview-image(card.id,0);}}}
                                     Text{text:card.image-count + " 张图片 · " + card.file-count + " 个文件";font-size:10px;color:#a18772;vertical-alignment:center;}
                                     if card.file-count>0 : Action{label:"文件";width:40px;height:28px;clicked=>{root.show-files(card.id);}}
                                     if card.has-image || card.file-count>0 : Action{label:"移除";width:40px;height:28px;clicked=>{root.inline-remove(card.id);}}
                                 }
-                                Text{text:card.reminder!=""?card.reminder:"未设置提醒";font-size:11px;color:#a18772;height:18px;}
-                                HorizontalLayout {height:28px;spacing:4px;
+                                Action{label:card.reminder!=""?card.reminder:"设置提醒";height:28px;quiet:true;clicked=>{root.reminder-id=root.reminder-id==card.id?-1:card.id;}}
+                                if root.reminder-id==card.id : HorizontalLayout {height:28px;spacing:4px;
                                     Action{label:"不提醒";height:28px;clicked=>{root.inline-reminder(card.id,0);}}
                                     Action{label:"30 分钟后";height:28px;clicked=>{root.inline-reminder(card.id,1);}}
                                     Action{label:root.later-label;height:28px;clicked=>{root.inline-reminder(card.id,2);}}
@@ -235,15 +260,41 @@ export component PocketWindow inherits Window {
                         if root.cards.length==0 : Rectangle{height:80px;Text{text:"还没有待办，在上面记下第一件事。";color:#b49b87;font-size:15px;horizontal-alignment:center;vertical-alignment:center;}}
                     }
                 }
-                Action{label:root.show-done?"收起已完成":"查看已完成";height:28px;quiet:true;clicked=>{root.fold();}}
+                if root.done-count>0 : Action{label:(root.show-done?"收起已完成 · ":"已完成 · ") + root.done-count;height:28px;quiet:true;clicked=>{root.fold();}}
             }
-            HorizontalLayout {height:20px;
-                Rectangle {width:5px;height:5px;border-radius:3px;background:root.notice!=""?#dca875:#adc19b;}
-                Text{text:root.notice!=""?root.notice:"Enter 收下 · 点击记录展开";color:#b39e8c;font-size:11px;vertical-alignment:center;}
-                Rectangle{horizontal-stretch:1;}
-                if root.completion-undo : Action{label:"撤销完成";quiet:true;width:64px;height:20px;clicked=>{root.undo-complete();}}
-                Action{label:"退出";quiet:true;width:36px;height:20px;clicked=>{root.quit();}}
+
+        }        Rectangle {x:18px;y:parent.height - 44px;width:parent.width - 36px;height:28px;border-radius:10px;background:#fff6e9;
+            opacity:root.notice!=""||root.completion-undo?1:0;animate opacity{duration:180ms;}
+            Text{x:10px;width:parent.width - (root.completion-undo?92px:20px);height:parent.height;text:root.last-notice;font-size:11px;color:#947455;overflow:elide;vertical-alignment:center;}
+            if root.completion-undo : Action{x:parent.width - 80px;width:76px;height:28px;quiet:true;label:"撤销完成";clicked=>{root.undo-complete();}}
+        }
+        if root.menu-open : Rectangle {width:parent.width;height:parent.height;background:transparent;
+            TouchArea{clicked=>{root.menu-open=false;}}
+            Rectangle{x:parent.width - 164px;y:52px;width:144px;height:88px;background:#fffdf9;border-radius:12px;border-width:1px;border-color:#eadfd3;
+                VerticalLayout{padding:8px;spacing:4px;
+                    Action{label:"收下剪贴板";height:32px;quiet:true;clicked=>{root.menu-open=false;root.capture();}}
+                    Action{label:"退出口袋";height:32px;quiet:true;clicked=>{root.quit();}}
+                }
             }
         }
+        if root.zoom-open : Rectangle {x:0px;y:0px;width:parent.width;height:parent.height;background:#fffdf9;border-radius:24px;
+            FocusScope{width:parent.width;height:parent.height;init=>{self.focus();}key-pressed(event)=>{if event.text==Key.Escape {root.close-image();return accept;}return reject;}}
+            VerticalLayout{padding:18px;spacing:12px;
+                HorizontalLayout{height:30px;
+                    Text{text:"图片 " + (root.zoom-index + 1) + " / " + root.zoom-count;font-size:14px;color:#695447;vertical-alignment:center;}
+                    Rectangle{horizontal-stretch:1;}
+                    Action{label:"收起";width:52px;height:28px;quiet:true;clicked=>{root.close-image();}}
+                }
+                Rectangle{vertical-stretch:1;background:#f7f4ee;border-radius:12px;
+                    Image{width:parent.width;height:parent.height;source:root.zoom-image;image-fit:contain;}
+                    TouchArea{mouse-cursor:pointer;clicked=>{root.close-image();}}
+                }
+                if root.zoom-count>1 : HorizontalLayout{height:30px;spacing:8px;
+                    Action{label:"上一张";height:30px;clicked=>{root.preview-image(root.zoom-note,Math.mod(root.zoom-index + root.zoom-count - 1,root.zoom-count));}}
+                    Action{label:"下一张";height:30px;clicked=>{root.preview-image(root.zoom-note,Math.mod(root.zoom-index + 1,root.zoom-count));}}
+                }
+            }
+        }
+
     }
 }

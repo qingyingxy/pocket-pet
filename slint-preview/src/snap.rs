@@ -39,9 +39,15 @@ pub fn split(source: RgbaImage, seed: u32) -> Split {
         }
         // The cream card surface dissolves separately so its area does not
         // overwhelm the much smaller text, icons and image details.
-        let cream = pixel[0].abs_diff(248) <= 3
-            && pixel[1].abs_diff(244) <= 3
-            && pixel[2].abs_diff(238) <= 3;
+        let cream = [
+            [248u8, 244, 238],
+            [250, 248, 244],
+            [244, 238, 229],
+            [245, 229, 206],
+            [250, 242, 231],
+        ]
+        .iter()
+        .any(|base| (0..3).all(|i| pixel[i].abs_diff(base[i]) <= 3));
         if cream {
             backdrop.put_pixel(x, y, *pixel);
             continue;
