@@ -64,10 +64,14 @@ impl Drop for Instance {
 #[serde(default)]
 pub struct Preferences {
     pub topmost: bool,
+    pub show_done: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { topmost: true }
+        Self {
+            topmost: true,
+            show_done: false,
+        }
     }
 }
 impl Preferences {
@@ -495,15 +499,26 @@ unsafe fn cat_icon() -> HICON {
 mod tests {
     use super::*;
     #[test]
-    fn topmost_defaults_on_and_roundtrips_without_touching_notes() {
+    fn preferences_default_and_roundtrip_without_touching_notes() {
         let dir = std::env::temp_dir().join(format!("pocket-tray-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("state.json"), b"keep notes").unwrap();
-        assert!(Preferences::load(&dir).unwrap().topmost);
-        Preferences { topmost: false }.save(&dir).unwrap();
-        assert!(!Preferences::load(&dir).unwrap().topmost);
-        Preferences { topmost: true }.save(&dir).unwrap();
-        assert!(Preferences::load(&dir).unwrap().topmost);
+        let defaults = Preferences::load(&dir).unwrap();
+        assert!(defaults.topmost);
+        assert!(!defaults.show_done);
+        Preferences {
+            topmost: false,
+            show_done: true,
+        }
+        .save(&dir)
+        .unwrap();
+        let restored = Preferences::load(&dir).unwrap();
+        assert!(!restored.topmost);
+        assert!(restored.show_done);
+        fs::write(dir.join("preferences.json"), br#"{"topmost":true}"#).unwrap();
+        let legacy = Preferences::load(&dir).unwrap();
+        assert!(legacy.topmost);
+        assert!(!legacy.show_done);
         assert_eq!(fs::read(dir.join("state.json")).unwrap(), b"keep notes");
         fs::remove_dir_all(dir).unwrap();
     }

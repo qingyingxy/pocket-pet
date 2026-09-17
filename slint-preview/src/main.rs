@@ -936,6 +936,8 @@ fn run() -> Result<()> {
     let pet = PetWindow::new()?;
     pet.set_topmost(preferences.topmost);
     ui.set_topmost(preferences.topmost);
+    ui.set_show_done(preferences.show_done);
+    let preferences = Rc::new(RefCell::new(preferences));
     let notice_timer = Rc::new(Timer::default());
     {
         let timer = notice_timer.clone();
@@ -1756,11 +1758,20 @@ fn run() -> Result<()> {
     }
     {
         let state = store.clone();
+        let settings = preferences.clone();
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         ui.on_fold(move || {
             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                ui.set_show_done(!ui.get_show_done());
+                let show_done = !ui.get_show_done();
+                let mut next = settings.borrow().clone();
+                next.show_done = show_done;
+                if let Err(error) = next.save(&state.borrow().dir) {
+                    report(&ui, error);
+                    return;
+                }
+                *settings.borrow_mut() = next;
+                ui.set_show_done(show_done);
                 sync(&ui, &pet, &mut state.borrow_mut());
                 place(&ui, &pet);
             }
@@ -1909,13 +1920,14 @@ fn run() -> Result<()> {
         }
     };
     let rail_window = rail::install(&ui, &pet)?;
-    rail_window.set_topmost(preferences.topmost);
+    rail_window.set_topmost(preferences.borrow().topmost);
     if let Some(tray) = tray.as_ref() {
         let control = tray.control();
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         let view = rail_window.as_weak();
         let state = store.clone();
+        let settings = preferences.clone();
         // The native tray thread never touches Slint components or the Store.
         let dispatcher = Rc::new(move |action: tray::Action| {
             let (Some(ui), Some(pet), Some(rail)) =
@@ -1960,18 +1972,18 @@ fn run() -> Result<()> {
                     }
                 }
                 tray::Action::ToggleTopmost => {
-                    let preferences = tray::Preferences {
-                        topmost: !pet.get_topmost(),
-                    };
-                    if let Err(error) = preferences.save(&state.borrow().dir) {
+                    let mut next = settings.borrow().clone();
+                    next.topmost = !pet.get_topmost();
+                    if let Err(error) = next.save(&state.borrow().dir) {
                         pet.set_desktop_hidden(false);
                         let _ = pet.show();
                         reveal(&ui, &pet);
                         report(&ui, error);
                     } else {
-                        pet.set_topmost(preferences.topmost);
-                        ui.set_topmost(preferences.topmost);
-                        rail.set_topmost(preferences.topmost);
+                        pet.set_topmost(next.topmost);
+                        ui.set_topmost(next.topmost);
+                        rail.set_topmost(next.topmost);
+                        *settings.borrow_mut() = next;
                     }
                 }
                 tray::Action::Exit => {

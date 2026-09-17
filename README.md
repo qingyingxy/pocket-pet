@@ -53,7 +53,7 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 
 ## 数据在哪里
 
-正式数据保存在 `%LOCALAPPDATA%\PocketPetSlintPreview`，包括 `state.json`、备份、`images/` 和 `files/`。备份时复制整个目录。撤销或移除记录引用不会立即删除附件文件。
+正式数据保存在 `%LOCALAPPDATA%\PocketPetSlintPreview`，包括 `state.json`、备份、`preferences.json`、`images/` 和 `files/`。`preferences.json` 会记住置顶和已完成列表的展开状态。备份时复制整个目录。撤销或移除记录引用不会立即删除附件文件。
 
 `--snapshot` 使用独立的 `slint-preview/preview-output/` 示例数据目录。构建产物、测试输出、诊断日志和本地数据不应上传 GitHub；分享截图和日志前请自行检查其中的私人信息。
 
