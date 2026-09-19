@@ -742,6 +742,11 @@ fn reveal(ui: &PocketWindow, pet: &PetWindow) {
     ui.window()
         .with_winit_window(|window| window.focus_window());
 }
+fn refresh_and_reveal(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store>>) {
+    ui.set_cards(ModelRc::new(VecModel::from(Vec::<CardData>::new())));
+    sync(ui, pet, &mut store.borrow_mut());
+    reveal(ui, pet);
+}
 fn hide(ui: &PocketWindow) {
     ui.set_menu_open(false);
     if ui.get_zoom_open() {
@@ -1837,6 +1842,7 @@ fn run() -> Result<()> {
         });
     }
     {
+        let state = store.clone();
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         pet.on_open_record(move || {
@@ -1845,12 +1851,13 @@ fn run() -> Result<()> {
                     ui.invoke_dismiss();
                 } else {
                     ui.invoke_change_view(false);
-                    reveal(&ui, &pet);
+                    refresh_and_reveal(&ui, &pet, &state);
                 }
             }
         });
     }
     {
+        let state = store.clone();
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         pet.on_open_tasks(move || {
@@ -1859,7 +1866,7 @@ fn run() -> Result<()> {
                     ui.invoke_dismiss();
                 } else {
                     ui.invoke_change_view(false);
-                    reveal(&ui, &pet);
+                    refresh_and_reveal(&ui, &pet, &state);
                 }
             }
         });
@@ -1888,13 +1895,14 @@ fn run() -> Result<()> {
         });
     }
     {
+        let state = store.clone();
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         let drag = dragging.clone();
         pet.on_drag_finished(move || {
             if drag.replace(false) && restore.replace(false) {
                 if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                    reveal(&ui, &pet);
+                    refresh_and_reveal(&ui, &pet, &state);
                 }
             }
         });
@@ -1943,7 +1951,7 @@ fn run() -> Result<()> {
                     pet.window().with_winit_window(|w| w.focus_window());
                     if matches!(action, tray::Action::Record) {
                         ui.set_task_view(false);
-                        reveal(&ui, &pet);
+                        refresh_and_reveal(&ui, &pet, &state);
                     }
                 }
                 tray::Action::ToggleVisibility => {
@@ -2063,7 +2071,7 @@ fn run() -> Result<()> {
     pet.invoke_rail_updated();
     pet.invoke_rail_place();
     if snapshot {
-        reveal(&ui, &pet);
+        refresh_and_reveal(&ui, &pet, &store);
     } else {
         ui.invoke_rail_status();
     }
@@ -2188,14 +2196,14 @@ fn run() -> Result<()> {
                             let _ = fs::write(out.join("snapshot-error.txt"), e.to_string());
                         }
                         ui.invoke_change_view(false);
-                        reveal(&ui, &pet);
+                        refresh_and_reveal(&ui, &pet, &state);
                         let weak = ui.as_weak();
                         let animal = pet.as_weak();
                         Timer::single_shot(Duration::from_millis(100), move || {
                             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                                 let result = check_input_flow(&ui, &pet, &state);
                                 let _ = fs::write(out.join("input-check.txt"), match result {
-                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, independent inline edit, Escape draft persistence".to_string(),
+                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, card model rebuild, independent inline edit, Escape draft persistence".to_string(),
                                     Err(e) => format!("FAIL: {e}"),
                                 });
                                 start_completion_check(&ui, &pet, state.clone());
@@ -2280,7 +2288,19 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
     if store.borrow().data.notes.len() != count + 1 || !ui.get_revealed() {
         return Err("Enter did not save and keep the unified panel open".into());
     }
-    reveal(ui, pet);
+    ui.set_cards(ModelRc::new(VecModel::from(Vec::<CardData>::new())));
+    refresh_and_reveal(ui, pet, store);
+    use slint::Model;
+    let expected = store
+        .borrow()
+        .data
+        .notes
+        .iter()
+        .filter(|note| ui.get_show_done() || !note.done)
+        .count();
+    if ui.get_cards().row_count() != expected {
+        return Err("reopening did not rebuild the visible card model".into());
+    }
     press(ui, "unfinished".into());
     let id = count as i32;
     ui.invoke_edit(id);
@@ -2346,7 +2366,7 @@ fn start_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<
         s.flush().unwrap();
         sync(ui, pet, &mut s);
     }
-    reveal(ui, pet);
+    refresh_and_reveal(ui, pet, &state);
     let weak = ui.as_weak();
     let check_state = state.clone();
     Timer::single_shot(Duration::from_millis(60), move || {
@@ -2456,7 +2476,7 @@ fn run_completion_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
             let stable = ui.get_panel_height() == height && ui.get_cards().row_count() == 0;
             snapshot_window(ui.window(), &state.borrow().dir.join("all-done.png"))?;
             hide(&ui);
-            reveal(&ui, &pet);
+            refresh_and_reveal(&ui, &pet, &state);
             let reopened_stable = ui.get_panel_height() == height;
             state.borrow_mut().data = before;
             sync(&ui, &pet, &mut state.borrow_mut());
@@ -2509,7 +2529,7 @@ fn start_reminder_check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<St
         }
         let _ = snapshot_window(pet.window(), &out.join("reminder-pet.png"));
         ui.invoke_change_view(true);
-        reveal(&ui, &pet);
+        refresh_and_reveal(&ui, &pet, &state);
         let weak = ui.as_weak();
         let animal = pet.as_weak();
         Timer::single_shot(Duration::from_millis(220), move || {
