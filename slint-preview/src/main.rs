@@ -745,6 +745,7 @@ fn reveal(ui: &PocketWindow, pet: &PetWindow) {
 fn refresh_and_reveal(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store>>) {
     ui.set_cards(ModelRc::new(VecModel::from(Vec::<CardData>::new())));
     sync(ui, pet, &mut store.borrow_mut());
+    ui.set_task_scroll_offset(0.0);
     reveal(ui, pet);
 }
 fn hide(ui: &PocketWindow) {
@@ -2203,7 +2204,7 @@ fn run() -> Result<()> {
                             if let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
                                 let result = check_input_flow(&ui, &pet, &state);
                                 let _ = fs::write(out.join("input-check.txt"), match result {
-                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, card model rebuild, independent inline edit, Escape draft persistence".to_string(),
+                                    Ok(()) => "PASS: autofocus, Shift+Enter, Enter saves without closing, card model rebuild and scroll reset, independent inline edit, Escape draft persistence".to_string(),
                                     Err(e) => format!("FAIL: {e}"),
                                 });
                                 start_completion_check(&ui, &pet, state.clone());
@@ -2289,6 +2290,7 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
         return Err("Enter did not save and keep the unified panel open".into());
     }
     ui.set_cards(ModelRc::new(VecModel::from(Vec::<CardData>::new())));
+    ui.set_task_scroll_offset(-240.0);
     refresh_and_reveal(ui, pet, store);
     use slint::Model;
     let expected = store
@@ -2300,6 +2302,9 @@ fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store
         .count();
     if ui.get_cards().row_count() != expected {
         return Err("reopening did not rebuild the visible card model".into());
+    }
+    if ui.get_task_scroll_offset() != 0.0 {
+        return Err("reopening did not scroll to the first visible card".into());
     }
     press(ui, "unfinished".into());
     let id = count as i32;

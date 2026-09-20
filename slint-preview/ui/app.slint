@@ -200,6 +200,7 @@ export component PocketWindow inherits Window {
     in property<int> pending-count;
     in property<[CardData]> cards;
     in property<bool> show-done:false;
+    in-out property<length> task-scroll-offset <=> task-scroll.viewport-y;
     in property<string> notice;
     callback save();callback draft-edited(string);callback paste-image() -> bool;callback capture();callback remove-image();
     callback toggle(int);callback edit(int);callback fold();callback dismiss();callback quit();callback change-view(bool);
