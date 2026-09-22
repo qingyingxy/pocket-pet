@@ -87,3 +87,13 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 ## 许可状态
 
 本项目自有代码、文档和 SVG 素材采用 [MIT License](LICENSE)。Slint 依照其免版税桌面应用许可使用，第三方依赖保留各自许可；详见 [许可与素材说明](docs/LICENSING.md)。
+
+## 安装与快捷方式
+
+构建发布版后，在仓库根目录运行 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 。脚本安装到 %LOCALAPPDATA%\Programs\PocketPet，创建小猫图标的桌面和开始菜单快捷方式并启动。更新时重新构建并运行即可；旧实例正常保存退出后才替换。已开启的开机启动路径同步更新，不自动开启。
+
+## 删除与恢复
+
+展开记录后点“···”：待办和已完成都可删除，已完成还可恢复到待办。连续删除合并为一批，从最后一次删除起提供 10 秒“撤销删除”。退出或重启不保留撤销机会。本版不设回收站。
+
+删除立即保存。撤销期结束后，仅清理本批涉及且当前数据、草稿和备份均不再引用的应用内附件副本，不删除拖入文件原件。备份引用的附件保留，暂不安排后续自动清理；删除不等于彻底擦除磁盘数据。

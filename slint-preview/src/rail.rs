@@ -170,6 +170,17 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
     let preference = Rc::new(Cell::new(true));
     let order = Rc::new(RefCell::new(Vec::<i32>::new()));
     {
+        let order = order.clone();
+        let view = rail.as_weak();
+        pet.on_rail_reset(move || {
+            order.borrow_mut().clear();
+            if let Some(rail) = view.upgrade() {
+                clear_dust(&rail);
+                rail.set_current(0);
+            }
+        });
+    }
+    {
         let weak = rail.as_weak();
         let animal = pet.as_weak();
         let preference = preference.clone();

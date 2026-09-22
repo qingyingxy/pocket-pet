@@ -16,6 +16,7 @@ slint::include_modules!();
 mod added_time;
 mod attention;
 mod clipboard;
+mod deletion;
 mod drop_import;
 mod drop_target;
 mod hotkey;
@@ -54,6 +55,7 @@ struct Store {
     cache: HashMap<String, Image>,
     undo: Option<CaptureUndo>,
     completion: Option<CompletionUndo>,
+    deletion: Option<deletion::DeletionUndo>,
     snap_rects: HashMap<usize, [f32; 6]>,
     snaps: HashMap<usize, SnapVisual>,
     finishing: HashMap<usize, (Note, bool, Instant)>,
@@ -98,6 +100,7 @@ impl Store {
             cache: HashMap::new(),
             undo: None,
             completion: None,
+            deletion: None,
             snap_rects: HashMap::new(),
             snaps: HashMap::new(),
             finishing: HashMap::new(),
@@ -474,6 +477,7 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
     } else {
         ui.set_cards(ModelRc::new(VecModel::from(cards)));
     }
+    ui.set_delete_undo(store.deletion_count() > 0);
     ui.set_completion_undo(store.completion.as_ref().is_some_and(|u| {
         Instant::now() < u.deadline && store.data.notes.get(u.index) == Some(&u.after)
     }));
@@ -771,7 +775,12 @@ fn toast(pet: &PetWindow, timer: &Timer, text: &str, undo: bool, error: bool) {
     pet.set_can_undo(undo);
     pet.set_toast_error(error);
     let weak = pet.as_weak();
-    timer.start(TimerMode::SingleShot, UNDO_DURATION, move || {
+    let duration = if undo || error {
+        UNDO_DURATION
+    } else {
+        Duration::from_millis(1500)
+    };
+    timer.start(TimerMode::SingleShot, duration, move || {
         if let Some(pet) = weak.upgrade() {
             pet.set_toast("".into());
             pet.set_can_undo(false);
@@ -878,6 +887,10 @@ fn restore_pet_position(pet: &PetWindow) {
 }
 fn run() -> Result<()> {
     use winit::platform::windows::WindowAttributesExtWindows;
+    if std::env::args().any(|a| a == "--quit") {
+        tray::request_exit()?;
+        return Ok(());
+    }
     let snapshot = std::env::args().any(|a| a == "--snapshot");
     let _instance = if snapshot {
         None
@@ -944,6 +957,7 @@ fn run() -> Result<()> {
     ui.set_topmost(preferences.topmost);
     ui.set_show_done(preferences.show_done);
     let preferences = Rc::new(RefCell::new(preferences));
+    deletion::install(&ui, &pet, store.clone());
     let notice_timer = Rc::new(Timer::default());
     {
         let timer = notice_timer.clone();
@@ -957,7 +971,9 @@ fn run() -> Result<()> {
                 timer.stop();
                 return;
             }
-            let seconds = if ui.get_completion_undo() {
+            let seconds = if ui.get_delete_undo() {
+                10
+            } else if ui.get_completion_undo() {
                 6
             } else if message.starts_with("未") || message.starts_with("无法") {
                 8
@@ -1754,7 +1770,7 @@ fn run() -> Result<()> {
                     {
                         s.undo = None;
                         pet.set_can_undo(false);
-                        pet.set_toast("记录已保留".into());
+                        pet.set_toast("".into());
                     }
                 }
                 sync(&ui, &pet, &mut s);
@@ -2143,6 +2159,11 @@ fn run() -> Result<()> {
             place(&ui, &pet);
         }
     });
+    if snapshot && std::env::args().any(|a| a == "--delete-check") {
+        deletion::check(&ui, &pet, store.clone());
+        slint::run_event_loop_until_quit()?;
+        return Ok(());
+    }
     if snapshot && tray_check {
         start_tray_check(&ui, &pet, &rail_window, store.borrow().dir.clone());
         slint::run_event_loop_until_quit()?;

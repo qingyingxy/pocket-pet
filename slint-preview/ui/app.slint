@@ -92,7 +92,7 @@ export component PetWindow inherits Window {
     in property<bool> topmost:true;
     in property<[RailCard]> rail-notes;
     in property<bool> rail-undo:false;
-    callback rail-updated();callback rail-place();callback rail-check();
+    callback rail-reset();callback rail-updated();callback rail-place();callback rail-check();
     callback preview-hover(bool);callback preview-drag(bool);
     out property<bool> preview-hovered:cat-hit.has-hover || count-hit.has-hover || (root.status-visible && badge-hit.has-hover);
     in property<bool> native-hover-events:false;
@@ -144,6 +144,11 @@ export component PetWindow inherits Window {
 
 export component PocketWindow inherits Window {
     callback tray-action(int);
+    callback delete-record(int);callback undo-delete();
+    in property<bool> delete-undo:false;
+    in-out property<int> record-menu:-1;
+    in-out property<bool> record-menu-done:false;
+    in-out property<float> record-menu-y:80;
     in property<bool> topmost:true;
     title:"口袋 · Slint 预览";width:448px;height:root.panel-height * 1px;
     out property<float> panel-height:570;
@@ -297,6 +302,7 @@ export component PocketWindow inherits Window {
                                     Rectangle{horizontal-stretch:1;}
                                     if root.editing-id!=card.id : Action{label:"编辑";height:24px;width:44px;quiet:true;clicked=>{root.editing-id=card.id;}}
                                     Action{label:"收起";height:24px;width:44px;quiet:true;clicked=>{root.edit(card.id);}}
+                                    Action{label:"···";height:24px;width:32px;quiet:true;clicked=>{root.record-menu=card.id;root.record-menu-done=card.done;root.record-menu-y=min(root.height/1px - 130,max(48,self.absolute-position.y/1px + 14));}}
                                 }
                                 Text{height:16px;text:card.added-exact;font-size:10px;color:#aa9685;}
                                 Rectangle {height:88px;background:#fffdf9;border-radius:8px;
@@ -355,9 +361,19 @@ export component PocketWindow inherits Window {
             }
 
         }        Rectangle {x:18px;y:parent.height - 44px;width:parent.width - 36px;height:28px;border-radius:10px;background:#fff6e9;
-            opacity:root.notice!=""||root.completion-undo?1:0;animate opacity{duration:180ms;}
-            Text{x:10px;width:parent.width - (root.completion-undo?92px:20px);height:parent.height;text:root.last-notice;font-size:11px;color:#947455;overflow:elide;vertical-alignment:center;}
-            if root.completion-undo : Action{x:parent.width - 80px;width:76px;height:28px;quiet:true;label:"撤销完成";clicked=>{root.undo-complete();}}
+            opacity:root.notice!=""||root.completion-undo||root.delete-undo?1:0;animate opacity{duration:180ms;}
+            Text{x:10px;width:parent.width - (root.completion-undo||root.delete-undo?92px:20px);height:parent.height;text:root.last-notice;font-size:11px;color:#947455;overflow:elide;vertical-alignment:center;}
+            if root.delete-undo : Action{x:parent.width - 80px;width:76px;height:28px;quiet:true;label:"撤销删除";clicked=>{root.undo-delete();}}
+            if root.completion-undo && !root.delete-undo : Action{x:parent.width - 80px;width:76px;height:28px;quiet:true;label:"撤销完成";clicked=>{root.undo-complete();}}
+        }
+        if root.record-menu>=0 : Rectangle {width:parent.width;height:parent.height;background:transparent;
+            TouchArea{clicked=>{root.record-menu=-1;}}
+            Rectangle{x:parent.width - 160px;y:root.record-menu-y*1px;width:144px;height:root.record-menu-done?84px:48px;border-radius:12px;background:#fffdf9;border-width:1px;border-color:#e8dacc;
+                VerticalLayout{padding:8px;spacing:4px;
+                    if root.record-menu-done : Action{label:"恢复到待办";height:32px;quiet:true;clicked=>{root.toggle(root.record-menu);root.record-menu=-1;}}
+                    Action{label:"删除";height:32px;quiet:true;clicked=>{root.delete-record(root.record-menu);root.record-menu=-1;}}
+                }
+            }
         }
         if root.menu-open : Rectangle {width:parent.width;height:parent.height;background:transparent;
             TouchArea{clicked=>{root.menu-open=false;}}

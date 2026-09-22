@@ -3365,6 +3365,7 @@ dependencies = [
  "i-slint-core",
  "image",
  "raw-window-handle",
+ "resvg",
  "serde",
  "serde_json",
  "slint",

@@ -24,3 +24,5 @@ Slint 1.17.1 提供 GPL-3.0-only、LicenseRef-Slint-Royalty-free-2.0 或 License
 ## 其他依赖
 
 两个 Cargo.lock 记录实际依赖版本。本阶段只发布源码，不发布预编译二进制；后续安装包应针对实际构建收集第三方许可证和 notices。本说明不是完整的二进制分发清单。
+
+快捷方式的 cat.ico 由现有 cat.svg 渲染生成，沿用其许可，可通过 examples/make_icon.rs 重新生成。本地安装脚本复制项目及 Slint 许可，尚不是公开发布安装包的完整第三方 notices 清单。

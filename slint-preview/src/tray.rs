@@ -18,11 +18,25 @@ const CLASS: &str = "PocketPetSlint.Tray.v1";
 const ACTIVATE: u32 = WM_APP + 31;
 const CALLBACK: u32 = WM_APP + 32;
 const STATE: u32 = WM_APP + 33;
+const REQUEST_EXIT: u32 = WM_APP + 34;
 const MUTEX_NAME: &str = "Local\\PocketPetSlint.Instance.v1";
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+/// Installation requests the normal save-and-exit path, never kills the process.
+pub fn request_exit() -> io::Result<()> {
+    unsafe {
+        let hwnd = FindWindowW(wide(CLASS).as_ptr(), ptr::null());
+        if hwnd.is_null() {
+            return Ok(());
+        }
+        if PostMessageW(hwnd, REQUEST_EXIT, 0, 0) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 pub struct Instance(HANDLE);
 impl Instance {
     pub fn acquire() -> io::Result<Option<Self>> {
@@ -281,6 +295,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         return 0;
     }
     match msg {
+        REQUEST_EXIT => {
+            context.dispatch(Action::Exit);
+            0
+        }
         ACTIVATE => {
             context.dispatch(Action::Show);
             0
