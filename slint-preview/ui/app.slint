@@ -1,7 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 
 export struct DustLayer { picture:image, delay:float, drift-x:float, drift-y:float, swirl:float }
-export struct CardData { id:int, added-relative:string, added-exact:string, multiline:bool, snap-ready:bool, snap-running:bool, snap-layers:[DustLayer], snap-backdrop:image, snap-x:float, snap-y:float, snap-width:float, snap-height:float, frozen-height:float, dissolving:bool, collapsing:bool, body:string, preview:image, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
+export struct CardData { id:int, added-relative:string, added-exact:string, multiline:bool, snap-ready:bool, snap-running:bool, snap-layers:[DustLayer], snap-backdrop:image, snap-x:float, snap-y:float, snap-width:float, snap-height:float, frozen-height:float, dissolving:bool, collapsing:bool, body:string, preview:image, preview-key:string, has-image:bool, image-count:int, file-count:int, done:bool, due:bool, reminder:string }
 
 component Action inherits Rectangle {
     in property<string> label;
@@ -98,7 +98,7 @@ export component PetWindow inherits Window {
     in property<bool> native-hover-events:false;
     in property<bool> desktop-hidden:false;
     changed preview-hovered=>{if !root.native-hover-events {root.preview-hover(root.preview-hovered);}}
-    width:180px; height:172px; background:transparent; no-frame:true; always-on-top:root.topmost;
+    width:160px; height:138px; background:transparent; no-frame:true; always-on-top:root.topmost;
     default-font-family:"Microsoft YaHei UI";
     in property<int> count;
     in property<int> due-count;
@@ -110,7 +110,24 @@ export component PetWindow inherits Window {
     in-out property<int> nudge-token;
     in property<bool> drop-hover:false;
     in property<bool> drop-busy:false;
-    Rectangle{x:8px;y:2px;width:150px;height:128px;border-radius:30px;background:root.drop-hover?#30edbc84:transparent;border-width:root.drop-hover?2px:0px;border-color:#dfa066;animate background{duration:100ms;}}
+    callback shape-changed(); callback pose-changed(); callback hit-test(float,float) -> bool;
+    changed count=>{root.shape-changed();}
+    changed status-visible=>{root.shape-changed();}
+    changed drop-hover=>{root.shape-changed();}
+    changed happy=>{root.pose-changed();}
+    changed celebrating=>{root.pose-changed();}
+    changed nudging=>{root.pose-changed();}
+    out property<image> pet-picture:@image-url("cat.svg");
+    out property<float> sprite-x:root.celebrating?9.75:14.25;
+    out property<float> sprite-y:root.happy || root.nudging ? 0 : 5.25;
+    out property<float> sprite-width:root.celebrating?105:96;
+    out property<float> sprite-height:root.celebrating?90:96;
+    animate sprite-x {duration:240ms;}
+    animate sprite-y {duration:170ms;easing:ease-out;}
+    animate sprite-width {duration:240ms;}
+    animate sprite-height {duration:240ms;}
+    out property<float> count-width:root.count>99?36:root.count>9?30:24;
+    Rectangle{x:6px;y:1.5px;width:112.5px;height:96px;border-radius:22.5px;background:root.drop-hover?#30edbc84:transparent;border-width:root.drop-hover?2px:0px;border-color:#dfa066;animate background{duration:100ms;}}
     in property<string> toast;
     in property<bool> can-undo:false;
     in property<bool> toast-error:false;
@@ -118,8 +135,8 @@ export component PetWindow inherits Window {
     callback open-record(); callback open-tasks(); callback drag(float,float); callback drag-finished();
     private property<length> origin-x; private property<length> origin-y;
     private property<bool> was-dragged:false;
-    Image { source:@image-url("cat.svg"); x:root.celebrating?13px:19px; y:root.happy || root.nudging ? 0px : 7px; width:root.celebrating?140px:128px; height:root.celebrating?120px:128px; animate width {duration:240ms;} animate height {duration:240ms;} animate x {duration:240ms;} image-fit:contain; animate y {duration:170ms;easing:ease-out;} }
-    cat-hit:=TouchArea { x:12px;y:0px;width:142px;height:133px;mouse-cursor:pointer;
+    Image { source:root.pet-picture; x:root.sprite-x*1px; y:root.sprite-y*1px; width:root.sprite-width*1px; height:root.sprite-height*1px; image-fit:contain; }
+    cat-hit:=TouchArea { x:6px;y:0px;width:112.5px;height:102px;mouse-cursor:pointer;
         pointer-event(event)=>{
             if event.kind == PointerEventKind.down {root.preview-drag(true);root.origin-x=self.mouse-x;root.origin-y=self.mouse-y;root.was-dragged=false;}
             if event.kind == PointerEventKind.up {root.preview-drag(false);root.drag-finished();}
@@ -131,12 +148,12 @@ export component PetWindow inherits Window {
         }}
         clicked=>{if !root.was-dragged {root.open-record();}}
     }
-    Rectangle {x:140px;y:8px;width:root.count>99?36px:root.count>9?30px:24px;height:24px;
+    Rectangle {x:105px;y:6px;width:root.count-width*1px;height:24px;
         visible:root.count>0;border-radius:12px;background:#fffaf5;border-width:1px;border-color:#e8dacc;
         Text {text:root.count>99?"99+":root.count;color:#796354;font-size:12px;font-weight:600;horizontal-alignment:center;vertical-alignment:center;}
         count-hit:=TouchArea {mouse-cursor:pointer;clicked=>{root.open-record();}}
     }
-    Rectangle {visible:root.status-visible;x:6px;y:137px;width:154px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;        animate background {duration:120ms;}
+    Rectangle {visible:root.status-visible;x:3px;y:104px;width:154px;height:30px;border-radius:15px;background:root.can-undo||root.due-count>0?#f7e6d7:#fffaf5;border-width:1px;border-color:#e8dacc;        animate background {duration:120ms;}
         Text {text:root.drop-hover?"松手，放进口袋":root.drop-busy?"正在收下…":root.toast!=""?root.toast:root.nudge-text!=""?root.nudge-text:root.due-count>0?"有 " + root.due-count + " 条提醒 · 查看":"已收下";color:#796354;font-size:12px;horizontal-alignment:center;vertical-alignment:center;}
         badge-hit:=TouchArea {mouse-cursor:pointer;clicked=>{if root.drop-hover||root.drop-busy {} else if root.can-undo {root.undo();} else if root.toast-error {root.open-record();} else {root.open-tasks();}}}
     }

@@ -116,10 +116,14 @@ impl Store {
         let mut refs = std::collections::HashSet::new();
         let mut protect = |n: &Note| {
             for name in &n.images {
-                refs.insert(PathBuf::from("images").join(name));
+                if let Some(path) = attachments::resolve(&self.dir, "images", name) {
+                    refs.insert(path);
+                }
             }
             for file in &n.files {
-                refs.insert(PathBuf::from("files").join(&file.path));
+                if let Some(path) = attachments::resolve(&self.dir, "files", &file.path) {
+                    refs.insert(path);
+                }
             }
         };
         for n in &self.data.notes {
@@ -143,46 +147,10 @@ impl Store {
                 .note
                 .images
                 .iter()
-                .map(|n| PathBuf::from("images").join(n))
-                .chain(
-                    r.note
-                        .files
-                        .iter()
-                        .map(|f| PathBuf::from("files").join(&f.path)),
-                );
-            for relative in paths {
-                if refs.contains(&relative) {
-                    continue;
-                }
-                // Only generated flat attachment files within this app's folders.
-                let components: Vec<_> = relative.components().collect();
-                if components.len() != 2 {
-                    continue;
-                }
-                if !matches!(components[0],std::path::Component::Normal(n) if n=="images"||n=="files")
-                    || !matches!(components[1], std::path::Component::Normal(_))
-                {
-                    continue;
-                }
-                let root = self.dir.join(components[0].as_os_str());
-                let file = self.dir.join(&relative);
-                if root
-                    .symlink_metadata()
-                    .is_ok_and(|m| m.file_type().is_symlink())
-                    || file
-                        .symlink_metadata()
-                        .is_ok_and(|m| m.file_type().is_symlink())
-                {
-                    continue;
-                }
-                // Resolve junctions too; never leave the data directory.
-                let (Ok(base), Ok(actual)) = (self.dir.canonicalize(), file.canonicalize()) else {
-                    continue;
-                };
-                if !actual.starts_with(&base) {
-                    continue;
-                }
-                let _ = fs::remove_file(file);
+                .map(|n| ("images", n.as_str()))
+                .chain(r.note.files.iter().map(|f| ("files", f.path.as_str())));
+            for (kind, relative) in paths {
+                attachments::remove(&self.dir, kind, relative, &refs);
             }
         }
     }
@@ -199,6 +167,34 @@ fn reset_views(ui: &PocketWindow, pet: &PetWindow) {
     pet.set_can_undo(false);
     pet.invoke_rail_reset();
 }
+
+fn schedule_expiry(
+    state: Rc<RefCell<Store>>,
+    weak: slint::Weak<PocketWindow>,
+    animal: slint::Weak<PetWindow>,
+    deadline: Instant,
+) {
+    let delay = deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1);
+    Timer::single_shot(delay, move || {
+        let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
+            return;
+        };
+        let mut s = state.borrow_mut();
+        if !s.deletion.as_ref().is_some_and(|u| u.deadline == deadline) {
+            return;
+        }
+        // Slint's cached/rounded timer clock can wake just before Instant's deadline.
+        // Keep the true undo interval, then retry rather than leave a stale button forever.
+        if Instant::now() < deadline {
+            drop(s);
+            schedule_expiry(state, weak, animal, deadline);
+            return;
+        }
+        s.expire_deletion(deadline);
+        sync(&ui, &pet, &mut s);
+    });
+}
+
 pub fn install(ui: &PocketWindow, pet: &PetWindow, store: Rc<RefCell<Store>>) {
     let state = store.clone();
     let weak = ui.as_weak();
@@ -217,17 +213,7 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow, store: Rc<RefCell<Store>>) {
         reset_views(&ui, &pet);
         sync(&ui, &pet, &mut s);
         ui.set_notice(format!("已删除 {count} 条 · 10 秒内可撤销").into());
-        let state = state.clone();
-        let weak = ui.as_weak();
-        let animal = pet.as_weak();
-        Timer::single_shot(DELETE_UNDO_DURATION, move || {
-            let (Some(ui), Some(pet)) = (weak.upgrade(), animal.upgrade()) else {
-                return;
-            };
-            let mut s = state.borrow_mut();
-            s.expire_deletion(deadline);
-            sync(&ui, &pet, &mut s);
-        });
+        schedule_expiry(state.clone(), ui.as_weak(), pet.as_weak(), deadline);
     });
     let weak = ui.as_weak();
     let animal = pet.as_weak();
@@ -341,6 +327,36 @@ pub fn check(ui: &PocketWindow, pet: &PetWindow, state: Rc<RefCell<Store>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_drop_copies_are_cleaned_but_shared_alias_and_draft_are_kept() {
+        let mut s = store();
+        fs::create_dir_all(s.dir.join("files/batch")).unwrap();
+        for name in ["removed.txt", "shared.txt", "draft.txt"] {
+            fs::write(s.dir.join("files/batch").join(name), b"copy").unwrap();
+            s.data.notes[0].files.push(Attachment {
+                name: name.into(),
+                path: format!("batch/{name}"),
+            });
+        }
+        s.data.notes[2].files.push(Attachment {
+            name: "shared".into(),
+            path: r"batch\shared.txt".into(),
+        });
+        s.buffer.files.push(Attachment {
+            name: "draft".into(),
+            path: "batch/draft.txt".into(),
+        });
+        s.flush().unwrap();
+        s.delete_note(0).unwrap();
+        s.flush().unwrap();
+        let deadline = Instant::now() - Duration::from_secs(1);
+        s.deletion.as_mut().unwrap().deadline = deadline;
+        s.expire_deletion(deadline);
+        assert!(!s.dir.join("files/batch/removed.txt").exists());
+        assert!(s.dir.join("files/batch/shared.txt").exists());
+        assert!(s.dir.join("files/batch/draft.txt").exists());
+        fs::remove_dir_all(s.dir).unwrap();
+    }
     #[test]
     fn cleanup_only_removes_unreferenced_app_copies_after_backup_rotates() {
         let mut s = store();

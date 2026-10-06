@@ -14,327 +14,42 @@ use std::{
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 slint::include_modules!();
 mod added_time;
+mod attachments;
 mod attention;
+mod benchmark;
 mod clipboard;
 mod deletion;
+mod diagnostics;
 mod drop_import;
 mod drop_target;
 mod hotkey;
+mod pet_shape;
 mod rail;
 mod reminders;
 mod snap;
+mod storage;
+mod store;
 mod tray;
+use store::*;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Attachment {
-    name: String,
-    path: String,
-}
-#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
-struct Note {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<u64>,
-    text: String,
-    images: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    files: Vec<Attachment>,
-    done: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remind_at: Option<u64>,
-}
-#[derive(Default, Clone, Serialize, Deserialize)]
-struct Data {
-    notes: Vec<Note>,
-    draft: Note,
-}
-struct Store {
-    data: Data,
-    buffer: Note,
-    selected: Option<usize>,
-    dir: PathBuf,
-    cache: HashMap<String, Image>,
-    undo: Option<CaptureUndo>,
-    completion: Option<CompletionUndo>,
-    deletion: Option<deletion::DeletionUndo>,
-    snap_rects: HashMap<usize, [f32; 6]>,
-    snaps: HashMap<usize, SnapVisual>,
-    finishing: HashMap<usize, (Note, bool, Instant)>,
-}
-struct SnapVisual {
-    backdrop: Image,
-    layers: ModelRc<DustLayer>,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    running: bool,
-    bytes: usize,
-    prepare_ms: f64,
-}
-struct CompletionUndo {
-    index: usize,
-    before: Note,
-    after: Note,
-    deadline: Instant,
-}
-struct CaptureUndo {
-    index: usize,
-    note: Note,
-    deadline: Instant,
-}
-const UNDO_DURATION: Duration = Duration::from_secs(6);
-impl Store {
-    fn load(dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(dir.join("images"))?;
-        let file = dir.join("state.json");
-        let data = if file.exists() {
-            serde_json::from_slice(&fs::read(file)?)?
-        } else {
-            Data::default()
-        };
-        Ok(Self {
-            buffer: data.draft.clone(),
-            data,
-            selected: None,
-            dir,
-            cache: HashMap::new(),
-            undo: None,
-            completion: None,
-            deletion: None,
-            snap_rects: HashMap::new(),
-            snaps: HashMap::new(),
-            finishing: HashMap::new(),
-        })
-    }
-    fn flush(&mut self) -> Result<()> {
-        if let Some(i) = self.selected {
-            self.data.notes[i] = self.buffer.clone();
-        } else {
-            self.data.draft = self.buffer.clone();
-        }
-        save_data(&self.dir, &self.data)
-    }
-    fn capture_note(&mut self, mut note: Note) -> Result<()> {
-        if note.text.trim().is_empty() && note.images.is_empty() && note.files.is_empty() {
-            return Err("没有可收下的内容".into());
-        }
-        let before = self.data.clone();
-        note.created_at = Some(reminders::now());
-        let index = self.data.notes.len();
-        self.data.notes.push(note.clone());
-        if let Err(error) = self.flush() {
-            self.data = before;
-            return Err(error);
-        }
-        self.undo = Some(CaptureUndo {
-            index,
-            note,
-            deadline: Instant::now() + UNDO_DURATION,
-        });
-        Ok(())
-    }
-    fn undo_capture(&mut self) -> Result<()> {
-        let undo = self.undo.as_ref().ok_or("没有可撤销的记录")?;
-        if Instant::now() >= undo.deadline {
-            self.undo = None;
-            return Err("撤销时间已过，记录仍在待办中".into());
-        }
-        if self.selected == Some(undo.index) || self.data.notes.get(undo.index) != Some(&undo.note)
-        {
-            self.undo = None;
-            return Err("记录已修改，已保留".into());
-        }
-        let index = undo.index;
-        let before = self.data.clone();
-        let old_selected = self.selected;
-        self.data.notes.remove(index);
-        if let Some(selected) = self.selected {
-            if selected > index {
-                self.selected = Some(selected - 1);
-            }
-        }
-        if let Err(error) = self.flush() {
-            self.data = before;
-            self.selected = old_selected;
-            return Err(error);
-        }
-        self.undo = None;
-        Ok(())
-    }
-    fn toggle_note(&mut self, index: usize) -> Result<()> {
-        if index >= self.data.notes.len() {
-            return Err("记录不存在".into());
-        }
-        let before = self.data.clone();
-        let buffer = self.buffer.clone();
-        let note = &mut self.data.notes[index];
-        note.done = !note.done;
-        if note.done {
-            note.remind_at = None;
-        }
-        let done = note.done;
-        let at = note.remind_at;
-        if self.selected == Some(index) {
-            self.buffer.done = done;
-            self.buffer.remind_at = at;
-        }
-        if let Err(error) = self.flush() {
-            self.data = before;
-            self.buffer = buffer;
-            return Err(error);
-        }
-        if self.undo.as_ref().is_some_and(|u| u.index == index) {
-            self.undo = None;
-        }
-        Ok(())
-    }
-    fn set_reminder(&mut self, index: usize, at: Option<u64>) -> Result<()> {
-        if index >= self.data.notes.len() {
-            return Err("记录不存在".into());
-        }
-        if self.data.notes[index].done && at.is_some() {
-            return Err("已完成的记录无需提醒".into());
-        }
-        let before = self.data.clone();
-        let buffer = self.buffer.clone();
-        self.data.notes[index].remind_at = at;
-        if self.selected == Some(index) {
-            self.buffer.remind_at = at;
-        }
-        if let Err(error) = self.flush() {
-            self.data = before;
-            self.buffer = buffer;
-            return Err(error);
-        }
-        if self.undo.as_ref().is_some_and(|u| u.index == index) {
-            self.undo = None;
-        }
-        Ok(())
-    }
-    fn update_record(&mut self, index: usize, update: impl FnOnce(&mut Note)) -> Result<()> {
-        let old = self.data.notes.get(index).ok_or("记录不存在")?.clone();
-        update(&mut self.data.notes[index]);
-        if let Err(e) = save_data(&self.dir, &self.data) {
-            self.data.notes[index] = old;
-            return Err(e);
-        }
-        Ok(())
-    }
-    fn complete(&mut self, index: usize) -> Result<()> {
-        let before = self.data.notes.get(index).ok_or("记录不存在")?.clone();
-        if before.done || self.finishing.contains_key(&index) {
-            return Err("这条记录已经完成".into());
-        }
-        self.toggle_note(index)?;
-        self.completion = Some(CompletionUndo {
-            index,
-            before: before.clone(),
-            after: self.data.notes[index].clone(),
-            deadline: Instant::now() + UNDO_DURATION,
-        });
-        self.undo = None;
-        self.finishing.insert(
-            index,
-            (before, false, self.completion.as_ref().unwrap().deadline),
-        );
-        Ok(())
-    }
-    fn undo_completion(&mut self) -> Result<()> {
-        let undo = self.completion.as_ref().ok_or("没有可撤销的完成操作")?;
-        if Instant::now() >= undo.deadline {
-            return Err("撤销时间已过，可在已完成中恢复".into());
-        }
-        if self.data.notes.get(undo.index) != Some(&undo.after) {
-            return Err("记录已修改，已保留".into());
-        }
-        let index = undo.index;
-        let before = undo.before.clone();
-        self.update_record(index, |n| *n = before)?;
-        self.finishing.remove(&index);
-        self.snaps.remove(&index);
-        self.snap_rects.remove(&index);
-        self.completion = None;
-        Ok(())
-    }
-    fn thumbnail(&mut self, name: &str) -> Image {
-        if let Some(image) = self.cache.get(name) {
-            return image.clone();
-        }
-        let result = (|| -> Result<Image> {
-            let mut reader = image::ImageReader::open(self.dir.join("images").join(name))?
-                .with_guessed_format()?;
-            let mut limits = image::Limits::default();
-            limits.max_alloc = Some(64 * 1024 * 1024);
-            limits.max_image_width = Some(16384);
-            limits.max_image_height = Some(16384);
-            reader.limits(limits);
-            let image = reader.decode()?.thumbnail(240, 160).to_rgba8();
-            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                image.as_raw(),
-                image.width(),
-                image.height(),
-            );
-            Ok(Image::from_rgba8(buffer))
-        })()
-        .unwrap_or_default();
-        if self.cache.len() >= 48 {
-            self.cache.clear();
-        }
-        self.cache.insert(name.into(), result.clone());
-        result
-    }
-    fn clipboard_image(&self) -> Result<Option<Note>> {
-        if let Some(image) = clipboard::read_image()? {
-            let name = format!(
-                "{}.png",
-                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-            );
-            image::save_buffer(
-                self.dir.join("images").join(&name),
-                image.as_raw(),
-                image.width(),
-                image.height(),
-                image::ColorType::Rgba8,
-            )?;
-            return Ok(Some(Note {
-                text: String::new(),
-                images: vec![name],
-                done: false,
-                remind_at: None,
-                files: vec![],
-                created_at: None,
-            }));
-        }
-        Ok(None)
-    }
-    fn clipboard(&self) -> Result<Note> {
-        if let Some(note) = self.clipboard_image()? {
-            return Ok(note);
-        }
-        let mut clipboard = arboard::Clipboard::new()?;
-        let text = clipboard.get_text()?;
-        if text.trim().is_empty() {
-            return Err("剪贴板是空的".into());
-        }
-        Ok(Note {
-            text,
-            images: vec![],
-            done: false,
-            remind_at: None,
-            files: vec![],
-            created_at: None,
-        })
-    }
-}
-fn save_data(dir: &Path, data: &Data) -> Result<()> {
-    fs::write(dir.join("state.tmp"), serde_json::to_vec_pretty(data)?)?;
-    if dir.join("state.json").exists() {
-        fs::copy(dir.join("state.json"), dir.join("state.backup.json"))?;
-    }
-    fs::rename(dir.join("state.tmp"), dir.join("state.json"))?;
-    Ok(())
-}
 fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
+    let previews = card_previews(ui);
+    sync_with_previews(ui, pet, store, &previews);
+}
+fn card_previews(ui: &PocketWindow) -> HashMap<String, Image> {
+    use slint::Model;
+    ui.get_cards()
+        .iter()
+        .filter(|card| !card.preview_key.is_empty())
+        .map(|card| (card.preview_key.to_string(), card.preview))
+        .collect()
+}
+fn sync_with_previews(
+    ui: &PocketWindow,
+    pet: &PetWindow,
+    store: &mut Store,
+    previews: &HashMap<String, Image>,
+) {
     let now = reminders::now();
     ui.set_reminder_label(reminders::label(store.buffer.remind_at, now).into());
     ui.set_later_label(
@@ -403,7 +118,12 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
         let preview = n
             .images
             .first()
-            .map(|name| store.thumbnail(name))
+            .map(|name| {
+                previews
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| store.thumbnail(name))
+            })
             .unwrap_or_default();
         cards.push(CardData {
             id: i as i32,
@@ -443,6 +163,7 @@ fn sync(ui: &PocketWindow, pet: &PetWindow, store: &mut Store) {
                 n.text.into()
             },
             preview,
+            preview_key: n.images.first().cloned().unwrap_or_default().into(),
             has_image: !n.images.is_empty(),
             image_count: n.images.len() as i32,
             file_count: n.files.len() as i32,
@@ -747,8 +468,12 @@ fn reveal(ui: &PocketWindow, pet: &PetWindow) {
         .with_winit_window(|window| window.focus_window());
 }
 fn refresh_and_reveal(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store>>) {
+    // Keep the previous model's immutable attachment previews alive while
+    // rebuilding the list. Clearing the bounded thumbnail cache used to decode
+    // every image again once there were more than 48 distinct attachments.
+    let previews = card_previews(ui);
     ui.set_cards(ModelRc::new(VecModel::from(Vec::<CardData>::new())));
-    sync(ui, pet, &mut store.borrow_mut());
+    sync_with_previews(ui, pet, &mut store.borrow_mut(), &previews);
     ui.set_task_scroll_offset(0.0);
     reveal(ui, pet);
 }
@@ -887,11 +612,18 @@ fn restore_pet_position(pet: &PetWindow) {
 }
 fn run() -> Result<()> {
     use winit::platform::windows::WindowAttributesExtWindows;
+    if std::env::args().any(|a| a == "--benchmark") {
+        return benchmark::run();
+    }
     if std::env::args().any(|a| a == "--quit") {
         tray::request_exit()?;
         return Ok(());
     }
     let snapshot = std::env::args().any(|a| a == "--snapshot");
+    let custom_output = diagnostics::argument("--snapshot-output")?;
+    if custom_output.is_some() && !snapshot {
+        return Err("--snapshot-output 只能与 --snapshot 一起使用".into());
+    }
     let _instance = if snapshot {
         None
     } else {
@@ -901,16 +633,26 @@ fn run() -> Result<()> {
         }
     };
     let dir = if snapshot {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output")
+        diagnostics::preview_dir()
     } else {
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA 不可用")?)
             .join("PocketPetSlintPreview")
     };
-    let preferences = if snapshot {
-        tray::Preferences::default()
+    if custom_output.is_some() {
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::create_dir(&dir)?;
+    }
+    let loaded_preferences = if snapshot {
+        storage::Loaded {
+            value: tray::Preferences::default(),
+            notice: None,
+        }
     } else {
-        tray::Preferences::load(&dir)?
+        tray::Preferences::load_with_recovery(&dir)?
     };
+    let preferences = loaded_preferences.value;
     let tray_check = std::env::args().any(|a| a == "--tray-check");
     let tray = if snapshot && !tray_check {
         None
@@ -932,6 +674,11 @@ fn run() -> Result<()> {
         .select()?;
     let _test_cursor = snapshot.then(rail::CursorRestore::new);
     let mut data = Store::load(dir)?;
+    let recovery_notice = [data.recovery_notice.take(), loaded_preferences.notice]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
     if snapshot {
         data.data = Data::default();
         data.data.notes = vec![
@@ -953,6 +700,7 @@ fn run() -> Result<()> {
     let store = Rc::new(RefCell::new(data));
     let ui = PocketWindow::new()?;
     let pet = PetWindow::new()?;
+    pet_shape::install(&pet)?;
     pet.set_topmost(preferences.topmost);
     ui.set_topmost(preferences.topmost);
     ui.set_show_done(preferences.show_done);
@@ -967,7 +715,10 @@ fn run() -> Result<()> {
                 return;
             };
             let message = ui.get_notice();
-            if message.is_empty() {
+            if message.is_empty()
+                || message.starts_with("已从备份")
+                || message.starts_with("显示偏好文件损坏")
+            {
                 timer.stop();
                 return;
             }
@@ -1197,6 +948,10 @@ fn run() -> Result<()> {
     sync(&ui, &pet, &mut store.borrow_mut());
     let save_timer = Rc::new(Timer::default());
     let toast_timer = Rc::new(Timer::default());
+    if !recovery_notice.is_empty() {
+        ui.set_notice(recovery_notice.into());
+        toast(&pet, &toast_timer, "数据已恢复 · 查看", false, true);
+    }
     let attention_clock = Instant::now();
     let attention = Rc::new(RefCell::new(attention::Attention::new(0)));
     {
@@ -1944,7 +1699,7 @@ fn run() -> Result<()> {
             }
         }
     };
-    let rail_window = rail::install(&ui, &pet)?;
+    let rail_window = rail::install(&ui, &pet, preferences.clone(), store.borrow().dir.clone())?;
     rail_window.set_topmost(preferences.borrow().topmost);
     if let Some(tray) = tray.as_ref() {
         let control = tray.control();
@@ -2052,6 +1807,7 @@ fn run() -> Result<()> {
         });
     }
     pet.show()?;
+    pet.invoke_shape_changed();
     let drop_guard = Rc::new(RefCell::new(None));
     {
         let holder = drop_guard.clone();
@@ -2169,6 +1925,12 @@ fn run() -> Result<()> {
         slint::run_event_loop_until_quit()?;
         return Ok(());
     }
+    if snapshot && std::env::args().any(|a| a == "--pet-check") {
+        ui.invoke_dismiss();
+        pet_shape::check(&ui, &pet, store.borrow().dir.clone());
+        slint::run_event_loop_until_quit()?;
+        return Ok(());
+    }
     if snapshot {
         let weak = ui.as_weak();
         let animal = pet.as_weak();
@@ -2253,6 +2015,26 @@ fn snapshot_window(window: &slint::Window, path: &Path) -> Result<()> {
         image::ColorType::Rgba8,
     )?;
     Ok(())
+}
+
+// Expanding a native region must repaint pixels previously clipped by Windows.
+fn redraw_full_window(window: &slint::Window) {
+    invalidate_full_window(window);
+    window.request_redraw();
+}
+
+fn invalidate_full_window(window: &slint::Window) {
+    use i_slint_core::lengths::{LogicalPoint, LogicalRect, LogicalSize};
+    let size = window.size();
+    let scale = window.scale_factor();
+    let bounds = LogicalRect::new(
+        LogicalPoint::new(0., 0.),
+        LogicalSize::new(size.width as f32 / scale, size.height as f32 / scale),
+    );
+    i_slint_core::window::WindowInner::from_pub(window)
+        .window_adapter()
+        .renderer()
+        .mark_dirty_region(bounds.into());
 }
 
 fn check_input_flow(ui: &PocketWindow, pet: &PetWindow, store: &Rc<RefCell<Store>>) -> Result<()> {
@@ -2710,6 +2492,10 @@ fn start_tray_check(ui: &PocketWindow, pet: &PetWindow, rail: &RailWindow, out: 
 }
 fn main() {
     if let Err(e) = run() {
+        if std::env::args().any(|a| a == "--snapshot" || a == "--benchmark") {
+            eprintln!("检查失败：{e}");
+            std::process::exit(1);
+        }
         let msg: Vec<u16> = format!("Slint 预览启动失败：{e}")
             .encode_utf16()
             .chain(Some(0))
@@ -2722,324 +2508,5 @@ fn main() {
                 MB_OK | MB_ICONERROR,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn cleanup_store(dir: &Path) {
-        for name in ["state.json", "state.backup.json"] {
-            if dir.join(name).exists() {
-                fs::remove_file(dir.join(name)).unwrap();
-            }
-        }
-        fs::remove_dir(dir.join("images")).unwrap();
-        fs::remove_dir(dir).unwrap();
-    }
-    #[test]
-    fn multiple_completions_undo_only_latest_and_recompletion_has_new_token() {
-        let mut s = temporary_store();
-        for text in ["first", "second"] {
-            s.data.notes.push(Note {
-                text: text.into(),
-                ..Note::default()
-            });
-        }
-        s.flush().unwrap();
-        s.complete(0).unwrap();
-        s.complete(1).unwrap();
-        let old = s.finishing[&1].2;
-        s.undo_completion().unwrap();
-        assert!(s.data.notes[0].done);
-        assert!(!s.data.notes[1].done);
-        assert!(s.finishing.contains_key(&0));
-        assert!(!s.finishing.contains_key(&1));
-        s.complete(1).unwrap();
-        assert_ne!(s.finishing[&1].2, old);
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn completion_is_durable_and_undo_restores_reminder_without_touching_draft() {
-        let mut s = temporary_store();
-        s.buffer.text = "keep my draft".into();
-        s.data.notes.push(Note {
-            text: "finish me".into(),
-            remind_at: Some(12345),
-            ..Note::default()
-        });
-        s.flush().unwrap();
-        s.complete(0).unwrap();
-        let loaded = Store::load(s.dir.clone()).unwrap();
-        assert!(loaded.data.notes[0].done);
-        assert_eq!(loaded.data.notes[0].remind_at, None);
-        assert!(s.complete(0).is_err());
-        s.undo_completion().unwrap();
-        let loaded = Store::load(s.dir.clone()).unwrap();
-        assert!(!loaded.data.notes[0].done);
-        assert_eq!(loaded.data.notes[0].remind_at, Some(12345));
-        assert_eq!(loaded.data.draft.text, "keep my draft");
-        assert!(s.finishing.is_empty());
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn failed_completion_and_expired_or_modified_undo_are_safe() {
-        let mut s = temporary_store();
-        s.data.notes.push(Note {
-            text: "test".into(),
-            ..Note::default()
-        });
-        s.flush().unwrap();
-        fs::create_dir(s.dir.join("state.tmp")).unwrap();
-        assert!(s.complete(0).is_err());
-        assert!(!s.data.notes[0].done);
-        assert!(s.finishing.is_empty());
-        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
-        s.complete(0).unwrap();
-        s.completion.as_mut().unwrap().deadline = Instant::now() - Duration::from_secs(1);
-        assert!(s.undo_completion().is_err());
-        assert!(s.data.notes[0].done);
-        s.completion.as_mut().unwrap().deadline = Instant::now() + UNDO_DURATION;
-        s.update_record(0, |n| n.text = "changed".into()).unwrap();
-        assert!(s.undo_completion().is_err());
-        assert_eq!(s.data.notes[0].text, "changed");
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn inline_edit_preserves_draft_and_rolls_back_failed_save() {
-        let mut s = temporary_store();
-        s.buffer.text = "unfinished new note".into();
-        s.data.notes.push(Note {
-            text: "old".into(),
-            ..Note::default()
-        });
-        s.flush().unwrap();
-        s.update_record(0, |n| n.text = "edited".into()).unwrap();
-        let loaded = Store::load(s.dir.clone()).unwrap();
-        assert_eq!(loaded.data.notes[0].text, "edited");
-        assert_eq!(loaded.data.draft.text, "unfinished new note");
-        assert_eq!(s.buffer.text, "unfinished new note");
-        fs::create_dir(s.dir.join("state.tmp")).unwrap();
-        assert!(s.update_record(0, |n| n.text = "unsaved".into()).is_err());
-        assert_eq!(s.data.notes[0].text, "edited");
-        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn reminder_persistence_legacy_and_completion() {
-        let old: Data = serde_json::from_str(r#"{"notes":[{"text":"旧记录","images":[],"done":false}],"draft":{"text":"","images":[],"done":false}}"#).unwrap();
-        assert!(old.notes[0].remind_at.is_none());
-        let mut s = temporary_store();
-        s.data = old;
-        s.set_reminder(0, Some(100)).unwrap();
-        let mut restarted = Store::load(s.dir.clone()).unwrap();
-        assert!(reminders::is_due(
-            restarted.data.notes[0].remind_at,
-            false,
-            200
-        ));
-        restarted
-            .set_reminder(0, Some(200 + reminders::HALF_HOUR))
-            .unwrap();
-        assert!(!reminders::is_due(
-            restarted.data.notes[0].remind_at,
-            false,
-            200
-        ));
-        restarted.toggle_note(0).unwrap();
-        restarted.toggle_note(0).unwrap();
-        let loaded = Store::load(s.dir.clone()).unwrap();
-        assert!(!loaded.data.notes[0].done);
-        assert!(loaded.data.notes[0].remind_at.is_none());
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn reminder_failed_save_preserves_selected_buffer() {
-        let mut s = temporary_store();
-        s.data.notes.push(Note {
-            text: "需要提醒".into(),
-            remind_at: Some(100),
-            ..Note::default()
-        });
-        s.selected = Some(0);
-        s.buffer = s.data.notes[0].clone();
-        s.flush().unwrap();
-        fs::create_dir(s.dir.join("state.tmp")).unwrap();
-        assert!(s.set_reminder(0, None).is_err());
-        assert_eq!(s.buffer.remind_at, Some(100));
-        assert_eq!(s.data.notes[0].remind_at, Some(100));
-        assert!(s.toggle_note(0).is_err());
-        assert!(!s.buffer.done);
-        fs::remove_dir(s.dir.join("state.tmp")).unwrap();
-        s.set_reminder(0, None).unwrap();
-        assert!(Store::load(s.dir.clone()).unwrap().data.notes[0]
-            .remind_at
-            .is_none());
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn file_only_drop_persists_and_undo_keeps_copy() {
-        let mut s = temporary_store();
-        fs::create_dir(s.dir.join("files")).unwrap();
-        fs::write(s.dir.join("files/测试.txt"), "附件内容").unwrap();
-        s.buffer.text = "未写完的草稿".into();
-        s.capture_note(Note {
-            files: vec![Attachment {
-                name: "测试.txt".into(),
-                path: "测试.txt".into(),
-            }],
-            ..Note::default()
-        })
-        .unwrap();
-        let loaded = Store::load(s.dir.clone()).unwrap();
-        assert_eq!(loaded.data.notes[0].files.len(), 1);
-        assert_eq!(loaded.buffer.text, "未写完的草稿");
-        s.undo_capture().unwrap();
-        assert!(Store::load(s.dir.clone()).unwrap().data.notes.is_empty());
-        assert_eq!(
-            fs::read_to_string(s.dir.join("files/测试.txt")).unwrap(),
-            "附件内容"
-        );
-        fs::remove_file(s.dir.join("files/测试.txt")).unwrap();
-        fs::remove_dir(s.dir.join("files")).unwrap();
-        cleanup_store(&s.dir);
-    }
-    fn temporary_store() -> Store {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let suffix = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Store::load(
-            std::env::temp_dir().join(format!("pocket-capture-{}-{suffix}", std::process::id())),
-        )
-        .unwrap()
-    }
-    #[test]
-    fn capture_undo_preserves_draft_and_only_removes_latest_capture() {
-        let mut store = temporary_store();
-        store.buffer.text = "正在写的草稿".into();
-        store
-            .capture_note(Note {
-                text: "第一次".into(),
-                ..Note::default()
-            })
-            .unwrap();
-        store
-            .capture_note(Note {
-                images: vec!["screenshot.png".into()],
-                ..Note::default()
-            })
-            .unwrap();
-        store.undo_capture().unwrap();
-        let loaded = Store::load(store.dir.clone()).unwrap();
-        assert_eq!(loaded.data.notes.len(), 1);
-        assert_eq!(loaded.data.notes[0].text, "第一次");
-        assert_eq!(loaded.buffer.text, "正在写的草稿");
-        assert!(store.undo_capture().is_err());
-        cleanup_store(&store.dir);
-    }
-    #[test]
-    fn expired_or_modified_capture_is_never_deleted() {
-        let mut store = temporary_store();
-        store
-            .capture_note(Note {
-                text: "保留".into(),
-                ..Note::default()
-            })
-            .unwrap();
-        store.undo.as_mut().unwrap().deadline = Instant::now();
-        assert!(store.undo_capture().is_err());
-        store
-            .capture_note(Note {
-                text: "可编辑".into(),
-                ..Note::default()
-            })
-            .unwrap();
-        store.data.notes[1].done = true;
-        assert!(store.undo_capture().is_err());
-        assert_eq!(store.data.notes.len(), 2);
-        cleanup_store(&store.dir);
-    }
-    #[test]
-    fn failed_write_rolls_back_capture_and_undo() {
-        let mut store = temporary_store();
-        store
-            .capture_note(Note {
-                text: "已保存".into(),
-                ..Note::default()
-            })
-            .unwrap();
-        fs::create_dir(store.dir.join("state.tmp")).unwrap();
-        assert!(store
-            .capture_note(Note {
-                text: "不能保存".into(),
-                ..Note::default()
-            })
-            .is_err());
-        assert_eq!(store.data.notes.len(), 1);
-        assert!(store.undo_capture().is_err());
-        assert_eq!(store.data.notes.len(), 1);
-        assert!(store.undo.is_some());
-        fs::remove_dir(store.dir.join("state.tmp")).unwrap();
-        store.undo_capture().unwrap();
-        assert!(Store::load(store.dir.clone())
-            .unwrap()
-            .data
-            .notes
-            .is_empty());
-        cleanup_store(&store.dir);
-    }
-    #[test]
-    fn added_time_survives_edit_completion_and_reload() {
-        let mut s = temporary_store();
-        s.capture_note(Note {
-            text: "记录".into(),
-            ..Note::default()
-        })
-        .unwrap();
-        let created = s.data.notes[0].created_at;
-        assert!(created.is_some());
-        s.selected = Some(0);
-        s.buffer = s.data.notes[0].clone();
-        s.buffer.text = "修改".into();
-        s.flush().unwrap();
-        s.toggle_note(0).unwrap();
-        s.toggle_note(0).unwrap();
-        assert_eq!(
-            Store::load(s.dir.clone()).unwrap().data.notes[0].created_at,
-            created
-        );
-        cleanup_store(&s.dir);
-    }
-    #[test]
-    fn round_trip_preserves_draft_and_backup() {
-        let dir = std::env::temp_dir().join(format!("slint-pet-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let mut data = Data {
-            notes: vec![Note {
-                text: "稍后回复".into(),
-                images: vec!["one.png".into()],
-                done: false,
-                remind_at: None,
-                files: vec![],
-                created_at: None,
-            }],
-            draft: Note {
-                text: "还没写完".into(),
-                ..Note::default()
-            },
-        };
-        save_data(&dir, &data).unwrap();
-        data.notes[0].done = true;
-        save_data(&dir, &data).unwrap();
-        let loaded: Data =
-            serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
-        let old: Data =
-            serde_json::from_slice(&fs::read(dir.join("state.backup.json")).unwrap()).unwrap();
-        assert!(loaded.notes[0].done);
-        assert!(!old.notes[0].done);
-        assert_eq!(loaded.draft.text, "还没写完");
-        for name in ["state.json", "state.backup.json"] {
-            fs::remove_file(dir.join(name)).unwrap();
-        }
-        fs::remove_dir(dir).unwrap();
     }
 }

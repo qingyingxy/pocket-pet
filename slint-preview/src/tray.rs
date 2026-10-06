@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
-    fs, io,
+    io,
     path::Path,
     ptr,
     sync::{mpsc, Arc, Mutex},
@@ -79,32 +79,26 @@ impl Drop for Instance {
 pub struct Preferences {
     pub topmost: bool,
     pub show_done: bool,
+    pub rail_left: bool,
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             topmost: true,
             show_done: false,
+            rail_left: true,
         }
     }
 }
 impl Preferences {
     pub fn load(dir: &Path) -> io::Result<Self> {
-        match fs::read(dir.join("preferences.json")) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
+        Self::load_with_recovery(dir).map(|loaded| loaded.value)
+    }
+    pub fn load_with_recovery(dir: &Path) -> io::Result<crate::storage::Loaded<Self>> {
+        crate::storage::load_preferences(dir)
     }
     pub fn save(&self, dir: &Path) -> io::Result<()> {
-        fs::create_dir_all(dir)?;
-        let temp = dir.join("preferences.tmp");
-        fs::write(
-            &temp,
-            serde_json::to_vec_pretty(self).map_err(io::Error::other)?,
-        )?;
-        // Windows rename replaces an existing file; notes and drafts are separate.
-        fs::rename(temp, dir.join("preferences.json"))
+        crate::storage::save(dir, "preferences", self)
     }
 }
 
@@ -516,6 +510,7 @@ unsafe fn cat_icon() -> HICON {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[test]
     fn preferences_default_and_roundtrip_without_touching_notes() {
         let dir = std::env::temp_dir().join(format!("pocket-tray-test-{}", std::process::id()));
@@ -527,16 +522,19 @@ mod tests {
         Preferences {
             topmost: false,
             show_done: true,
+            rail_left: false,
         }
         .save(&dir)
         .unwrap();
         let restored = Preferences::load(&dir).unwrap();
         assert!(!restored.topmost);
         assert!(restored.show_done);
+        assert!(!restored.rail_left);
         fs::write(dir.join("preferences.json"), br#"{"topmost":true}"#).unwrap();
         let legacy = Preferences::load(&dir).unwrap();
         assert!(legacy.topmost);
         assert!(!legacy.show_done);
+        assert!(legacy.rail_left);
         assert_eq!(fs::read(dir.join("state.json")).unwrap(), b"keep notes");
         fs::remove_dir_all(dir).unwrap();
     }

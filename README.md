@@ -19,11 +19,12 @@
 - **随手记录**：点击小猫打开统一面板，顶部输入，下方查看待办；支持文字、截图和文件附件。
 - **轻量速览**：悬停小猫，侧边浮出待办卡片；滚轮翻阅，点击正文进入完整面板。
 - **安静的数量提示**：右上角仅显示数字，零待办隐藏，超过 99 显示 `99+`。
+- **紧凑的桌面占用**：小猫默认 96×96 逻辑像素，透明边缘和隐藏提示条释放鼠标点击。
 - **快捷收下**：Ctrl+V 粘贴（含 PixPin 位图兼容处理）；拖到小猫上收下；Ctrl+Alt+V 直接收下剪贴板。
 - **完成与撤销**：完成时播放像素消散，提供 6 秒撤销；显示记录加入时间。
 - **轻提醒**：按需设置提醒；长时间未查看待办时轻提示，不自动打开面板。
 
-资源占用是设计目标，目前没有可复现的性能基准，不承诺固定内存占用。
+资源占用是设计目标，已提供使用模拟数据的 [性能测量脚本与样本](docs/PERFORMANCE.md)，不承诺固定内存占用。
 
 ## 从源码运行
 
@@ -53,7 +54,9 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 
 ## 数据在哪里
 
-正式数据保存在 `%LOCALAPPDATA%\PocketPetSlintPreview`，包括 `state.json`、备份、`preferences.json`、`images/` 和 `files/`。`preferences.json` 会记住置顶和已完成列表的展开状态。备份时复制整个目录。撤销或移除记录引用不会立即删除附件文件。
+正式数据保存在 `%LOCALAPPDATA%\PocketPetSlintPreview`，包括 `state.json`、备份、`preferences.json`、`images/` 和 `files/`。`preferences.json` 会记住置顶、已完成列表的展开状态和速览左右偏好。备份时复制整个目录。撤销或移除记录引用不会立即删除附件文件。
+
+保存先写临时文件并同步，再替换正式文件；上一次有效状态保留为备份。启动时若主数据缺失或损坏，会尝试恢复有效备份并提示可能缺少最后一次修改；损坏原文件另存为 `state.corrupt.*.json`。主数据和备份都不可用时停止启动，保留文件供恢复。显示偏好损坏时可恢复备份或默认设置，记录不受影响。
 
 `--snapshot` 使用独立的 `slint-preview/preview-output/` 示例数据目录。构建产物、测试输出、诊断日志和本地数据不应上传 GitHub；分享截图和日志前请自行检查其中的私人信息。
 
@@ -68,6 +71,8 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 ```
 
 预览模式会短暂打开窗口，生成截图和 `*-check.txt`，然后退出。请检查结果文件中的 PASS/FAIL；进程退出成功不代表所有检查通过。快照和窗口可见标志也不能替代真实桌面上的显示、焦点与多屏验证。
+
+也可在仓库根目录运行 `./scripts/verify.ps1` 一次完成格式、测试、发布构建和四组预览检查，包括小猫的原生边界与窗口命中。它为每组生成新目录，并检查报告缺失、FAIL 和异常；已有依赖时可加 `-Offline`。运行 `./scripts/benchmark.ps1 -Offline` 可测量 0/100/1000 条模拟记录，`-Images` 加入模拟图片。详见 [验收清单](docs/VALIDATION.md) 和 [性能测量](docs/PERFORMANCE.md)。
 
 ## 仓库导航
 

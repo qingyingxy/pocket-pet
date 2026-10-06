@@ -14,6 +14,8 @@ cargo build --release --locked --manifest-path slint-preview/Cargo.toml
 
 测试全局快捷键前退出应用。UI 修改还应运行 `--snapshot` 并检查对应 `*-check.txt`；窗口相关修改必须额外实机检查启动、悬停、点击展开、拖动和退出。不要将内部快照当作最终桌面画面的证明。
 
+可用 `./scripts/verify.ps1 -Offline` 串起上述检查和四组隔离预览，检查报告缺失及 FAIL；小猫边界组检查原生区域与窗口命中，`-NativeHover` 会短暂移动实际鼠标。可用 `./scripts/benchmark.ps1 -Offline` 测量模拟场景资源占用，`-Images` 增加图片。验证边界与复现方式见 [VALIDATION.md](docs/VALIDATION.md) 和 [PERFORMANCE.md](docs/PERFORMANCE.md)。
+
 ## 报告问题
 
 请先查看已知问题，描述期望行为、实际行为、复现步骤，并提供 Windows 版本、缩放比例和显示器数量。截图、日志和示例文件请移除私人待办、联系人与路径。

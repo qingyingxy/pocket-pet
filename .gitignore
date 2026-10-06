@@ -24,3 +24,9 @@ Thumbs.db
 
 **/preferences.json
 **/preferences.tmp
+**/state.backup.tmp
+**/state.corrupt.*.json
+**/preferences.backup.json
+**/preferences.backup.tmp
+**/preferences.corrupt.*.json
+**/preferences.backup.corrupt.*.json

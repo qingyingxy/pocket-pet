@@ -1,20 +1,23 @@
 use super::*;
 use slint::Model;
+use std::collections::HashSet;
 
 // Existing entries keep their order; new records follow the focused entry.
-fn reconcile(old: &[i32], incoming: &[i32], focus: Option<i32>) -> (Vec<i32>, usize) {
+pub(super) fn reconcile(old: &[i32], incoming: &[i32], focus: Option<i32>) -> (Vec<i32>, usize) {
     let previous = focus
         .and_then(|id| old.iter().position(|x| *x == id))
         .unwrap_or(0);
+    let incoming_ids: HashSet<_> = incoming.iter().copied().collect();
     let mut order: Vec<_> = old
         .iter()
         .copied()
-        .filter(|id| incoming.contains(id))
+        .filter(|id| incoming_ids.contains(id))
         .collect();
+    let existing_ids: HashSet<_> = order.iter().copied().collect();
     let additions: Vec<_> = incoming
         .iter()
         .copied()
-        .filter(|id| !order.contains(id))
+        .filter(|id| !existing_ids.contains(id))
         .collect();
     let at = focus
         .and_then(|id| order.iter().position(|x| *x == id))
@@ -61,11 +64,16 @@ fn position(rail: &RailWindow, pet: &PetWindow, prefer_left: bool) {
     }
 }
 
-pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
+pub fn install(
+    ui: &PocketWindow,
+    pet: &PetWindow,
+    settings: Rc<RefCell<tray::Preferences>>,
+    dir: PathBuf,
+) -> Result<RailWindow> {
     let rail = RailWindow::new()?;
     // Native entry is independent of movement: winit deduplicates identical positions.
     pet.set_native_hover_events(
-        !std::env::args().any(|a| a == "--snapshot")
+        !std::env::args().any(|a| a == "--snapshot" || a == "--benchmark")
             || std::env::args().any(|a| a == "--native-hover"),
     );
     {
@@ -139,6 +147,7 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
         let diagnostic = preview.clone();
         pet.window().on_winit_window_event(move |window, event| {
             if let Some(pet) = animal.upgrade() {
+                pet_shape::window_event(&pet, event);
                 if !pet.get_native_hover_events() {
                     return EventResult::Propagate;
                 }
@@ -167,7 +176,7 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
             EventResult::Propagate
         });
     }
-    let preference = Rc::new(Cell::new(true));
+    let preference = Rc::new(Cell::new(settings.borrow().rail_left));
     let order = Rc::new(RefCell::new(Vec::<i32>::new()));
     {
         let order = order.clone();
@@ -210,9 +219,10 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
             {
                 clear_dust(&rail);
             }
+            let by_id: HashMap<_, _> = incoming.into_iter().map(|n| (n.id, n)).collect();
             let entries: Vec<_> = next
                 .iter()
-                .filter_map(|id| incoming.iter().find(|n| n.id == *id).cloned())
+                .filter_map(|id| by_id.get(id).cloned())
                 .collect();
             if !old.is_empty() && next.is_empty() {
                 rail.set_empty_message(true);
@@ -251,9 +261,20 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
         let weak = rail.as_weak();
         let animal = pet.as_weak();
         let preference = preference.clone();
+        let weak_ui = ui.as_weak();
         rail.on_flip(move || {
             if let (Some(rail), Some(pet)) = (weak.upgrade(), animal.upgrade()) {
-                preference.set(!rail.get_left_side());
+                let mut next = settings.borrow().clone();
+                next.rail_left = !rail.get_left_side();
+                if let Err(error) = next.save(&dir) {
+                    if let Some(ui) = weak_ui.upgrade() {
+                        reveal(&ui, &pet);
+                        report(&ui, error);
+                    }
+                    return;
+                }
+                preference.set(next.rail_left);
+                *settings.borrow_mut() = next;
                 position(&rail, &pet, preference.get());
             }
         });
@@ -370,7 +391,7 @@ pub fn install(ui: &PocketWindow, pet: &PetWindow) -> Result<RailWindow> {
         let weak = rail.as_weak();
         Timer::single_shot(Duration::from_millis(650), move || {
             if let Some(rail) = weak.upgrade() {
-                let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+                let out = diagnostics::preview_dir();
                 let _ = snapshot_window(rail.window(), &out.join("side-rail.png"));
             }
         });
@@ -426,7 +447,7 @@ fn check(ui: &PocketWindow, rail: &RailWindow) {
         let (Some(ui), Some(rail)) = (weak.upgrade(), view.upgrade()) else {
             return;
         };
-        let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+        let out = diagnostics::preview_dir();
         rail.set_current(0);
         rail.window()
             .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
@@ -604,19 +625,7 @@ struct Preview {
 // rendering cache. Invalidate the entire surface only on reveal; a plain
 // request_redraw would restore only changed controls.
 fn redraw_revealed_rail(rail: &RailWindow) {
-    use i_slint_core::lengths::{LogicalPoint, LogicalRect, LogicalSize};
-    let window = rail.window();
-    let size = window.size();
-    let scale = window.scale_factor();
-    let bounds = LogicalRect::new(
-        LogicalPoint::new(0., 0.),
-        LogicalSize::new(size.width as f32 / scale, size.height as f32 / scale),
-    );
-    i_slint_core::window::WindowInner::from_pub(window)
-        .window_adapter()
-        .renderer()
-        .mark_dirty_region(bounds.into());
-    window.request_redraw();
+    redraw_full_window(rail.window());
 }
 impl Preview {
     fn trace(&self, event: &str) {
@@ -629,7 +638,7 @@ impl Preview {
         let detail = self.ui.upgrade().is_some_and(|ui| ui.get_revealed());
         let snapshot = std::env::args().any(|a| a == "--snapshot");
         let dir = if snapshot {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output")
+            diagnostics::preview_dir()
         } else {
             std::env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
@@ -844,7 +853,7 @@ fn check_hover(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
                 }
                 _ => rail.get_preview_visible() && native_visible(&rail),
             };
-            let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+            let out = diagnostics::preview_dir();
             use std::io::Write;
             if let Ok(mut log) = fs::OpenOptions::new()
                 .create(true)
@@ -862,7 +871,7 @@ fn check_hover(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
             }
             passed.set(passed.get() && ok);
             if stage == 10 {
-                let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+                let out = diagnostics::preview_dir();
                 let result = if passed.get() {
                     "PASS: 200ms hover open, gap grace, 400ms leave close, click detail, close suppression and re-entry"
                 } else {
@@ -884,9 +893,7 @@ fn native_visible(rail: &RailWindow) -> bool {
 }
 
 fn pet_hover_area(pet: &PetWindow, x: f32, y: f32) -> bool {
-    (12.0..=154.0).contains(&x) && (0.0..=133.0).contains(&y)
-        || pet.get_count() > 0 && (140.0..=176.0).contains(&x) && (8.0..=32.0).contains(&y)
-        || pet.get_status_visible() && (6.0..=160.0).contains(&x) && (137.0..=167.0).contains(&y)
+    pet.invoke_hit_test(x, y)
 }
 
 fn post_pet_pointer(pet: &PetWindow, inside: bool) {
@@ -962,8 +969,40 @@ fn pet_cursor_inside(pet: &PetWindow) -> Option<bool> {
     });
     result.get()
 }
+fn pointer_route(pet: &PetWindow) -> (Option<bool>, String) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+    let mut result = (None, String::from("unavailable"));
+    pet.window().with_winit_window(|window| {
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                unsafe {
+                    let mut point = POINT { x: 0, y: 0 };
+                    if GetCursorPos(&mut point) != 0 {
+                        let target = WindowFromPoint(point);
+                        let mut class = [0u16; 128];
+                        let length = GetClassNameW(target, class.as_mut_ptr(), class.len() as i32);
+                        let hits_pet = target == h.hwnd.get() as HWND;
+                        result = (
+                            Some(hits_pet),
+                            format!(
+                                "hits_pet={} hit_class={} capture={:?}",
+                                hits_pet,
+                                String::from_utf16_lossy(&class[..length.max(0) as usize]),
+                                GetCapture()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    });
+    result
+}
 fn check_cycles(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
     let passed = Rc::new(Cell::new(true));
+    let interrupted = Rc::new(Cell::new(false));
+    let native = std::env::args().any(|a| a == "--native-hover");
     post_pet_pointer(pet, false);
     rail.invoke_preview_hover(false);
     for cycle in 0..10u64 {
@@ -972,6 +1011,7 @@ fn check_cycles(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
             let view = rail.as_weak();
             let animal = pet.as_weak();
             let passed = passed.clone();
+            let interrupted = interrupted.clone();
             Timer::single_shot(Duration::from_millis(cycle * 1500 + offset), move || {
                 let (Some(ui), Some(rail), Some(pet)) =
                     (weak.upgrade(), view.upgrade(), animal.upgrade())
@@ -990,21 +1030,34 @@ fn check_cycles(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
                     }
                     _ => !rail.get_preview_visible() && !native_visible(&rail),
                 };
-                let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+                let inside = pet_cursor_inside(&pet);
+                let (hits_pet, route) = pointer_route(&pet);
+                if native
+                    && (if action <= 1 {
+                        inside != Some(true) || hits_pet != Some(true)
+                    } else {
+                        inside != Some(false)
+                    })
+                {
+                    interrupted.set(true);
+                }
+                let out = diagnostics::preview_dir();
                 use std::io::Write;
                 if let Ok(mut log) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(out.join("hover-cycles-trace.txt"))
                 {
-                    let _=writeln!(log,"cycle={cycle} action={action} ok={ok} actual_pointer_inside={:?} preview={} native={}",pet_cursor_inside(&pet),rail.get_preview_visible(),native_visible(&rail));
+                    let _=writeln!(log,"cycle={cycle} action={action} ok={ok} actual_pointer_inside={inside:?} preview={} native={} route={route}",rail.get_preview_visible(),native_visible(&rail));
                 }
                 passed.set(passed.get() && ok);
                 if cycle == 9 && action == 3 {
-                    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+                    let out = diagnostics::preview_dir();
                     let _ = fs::write(
                         out.join("hover-cycles-check.txt"),
-                        if passed.get() {
+                        if interrupted.get() {
+                            "INCONCLUSIVE: mouse moved or another window covered the pet; repeat on an idle desktop"
+                        } else if passed.get() {
                             "PASS: ten consecutive same-position enter/leave cycles"
                         } else {
                             "FAIL: repeated native hover cycle"
@@ -1062,7 +1115,7 @@ fn check_quick(ui: &PocketWindow, rail: &RailWindow, pet: &PetWindow) {
             };
             passed.set(passed.get() && ok);
             if action == 5 {
-                let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preview-output");
+                let out = diagnostics::preview_dir();
                 let _ = fs::write(
                     out.join("hover-quick-check.txt"),
                     if passed.get() {

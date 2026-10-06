@@ -174,24 +174,7 @@ pub fn discard(note: &Note, dir: &Path) {
         .map(|p| ("images", p))
         .chain(note.files.iter().map(|f| ("files", &f.path)))
     {
-        if Path::new(relative)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            continue;
-        }
-        let base = dir.join(kind);
-        let path = base.join(relative);
-        if let (Ok(root), Ok(target)) = (base.canonicalize(), path.canonicalize()) {
-            if target.starts_with(&root) && target.is_file() {
-                let _ = fs::remove_file(&target);
-                if let Some(parent) = target.parent() {
-                    if parent != root {
-                        let _ = fs::remove_dir(parent);
-                    }
-                }
-            }
-        }
+        crate::attachments::remove(dir, kind, relative, &std::collections::HashSet::new());
     }
 }
 
